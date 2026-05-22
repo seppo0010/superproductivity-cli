@@ -282,6 +282,13 @@ def list_tasks(
         params["projectId"] = _match_project(project, all_projects)
 
     tasks: list = _get("/tasks", params)
+    tasks.sort(key=lambda t: (
+        t["dueWithTime"]
+        if t.get("dueWithTime")
+        else datetime.strptime(t["dueDay"], "%Y-%m-%d").timestamp() * 1000
+        if t.get("dueDay")
+        else float("inf")
+    ))
 
     if not tasks:
         console.print("[yellow]No tasks found.[/yellow]")
