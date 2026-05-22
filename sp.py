@@ -11,7 +11,7 @@ Tip: alias sp='python /path/to/sp.py'
 from __future__ import annotations
 
 import sys
-from datetime import datetime
+from datetime import date, datetime, timedelta
 from typing import List, Optional
 
 import questionary
@@ -346,6 +346,30 @@ def delete(
             raise typer.Exit(0)
     _delete(f"/tasks/{task['id']}")
     console.print(f"[red]✗[/red] Deleted: [bold]{task['title']}[/bold]")
+
+
+@app.command()
+def punt(
+    query: Optional[str] = typer.Argument(
+        None, help="Part of the task title to search for"
+    ),
+):
+    """Push a task's due date to the next day."""
+    task = _resolve_task(query)
+
+    if task.get("dueWithTime"):
+        new_ts = task["dueWithTime"] + 86_400_000
+        _patch(f"/tasks/{task['id']}", {"dueWithTime": new_ts})
+        label = datetime.fromtimestamp(new_ts / 1000).strftime("%Y-%m-%d %H:%M")
+    elif task.get("dueDay"):
+        current = datetime.strptime(task["dueDay"], "%Y-%m-%d").date()
+        label = (current + timedelta(days=1)).strftime("%Y-%m-%d")
+        _patch(f"/tasks/{task['id']}", {"dueDay": label})
+    else:
+        label = (date.today() + timedelta(days=1)).strftime("%Y-%m-%d")
+        _patch(f"/tasks/{task['id']}", {"dueDay": label})
+
+    console.print(f"[green]✓[/green] Punted: [bold]{task['title']}[/bold]  → {label}")
 
 
 if __name__ == "__main__":
