@@ -10,6 +10,7 @@ Tip: alias sp='python /path/to/sp.py'
 
 from __future__ import annotations
 
+import re
 import sys
 from datetime import date, datetime, timedelta
 from typing import List, Optional
@@ -92,6 +93,90 @@ def _project_name(task: dict, all_projects: list) -> str:
     return next((p["title"] for p in all_projects if p["id"] == pid), "?")
 
 
+def _hex_color_from(obj: dict) -> Optional[str]:
+    """Extract a hex color from a tag or project dict (color field, then theme.primary)."""
+    direct = obj.get("color")
+    if direct and re.match(r"#[0-9a-fA-F]{6}$", direct):
+        return direct
+    primary = obj.get("theme", {}).get("primary", "")
+    m = re.match(r"rgb\(\s*(\d+),\s*(\d+),\s*(\d+)\s*\)", primary)
+    if m:
+        r, g, b = int(m.group(1)), int(m.group(2)), int(m.group(3))
+        return f"#{r:02x}{g:02x}{b:02x}"
+    if re.match(r"#[0-9a-fA-F]{6}$", primary):
+        return primary
+    return None
+
+
+def _project_hex_color(project: dict) -> Optional[str]:
+    return _hex_color_from(project)
+
+
+def _rich_badge(name: str, color: Optional[str]) -> str:
+    if not color:
+        return name
+    r, g, b = int(color[1:3], 16), int(color[3:5], 16), int(color[5:7], 16)
+    text = "black" if (0.299 * r + 0.587 * g + 0.114 * b) / 255 > 0.5 else "white"
+    return f"[{text} on {color}] {name} [/]"
+
+
+def _project_rich_label(project: dict) -> str:
+    return _rich_badge(project["title"], _project_hex_color(project))
+
+
+def _fmt_duration(ms: int) -> str:
+    if not ms:
+        return ""
+    total_min = ms // 60_000
+    h, m = divmod(total_min, 60)
+    return f"{h}h {m:02d}m" if h else f"{m}m"
+
+
+def _tags_rich_text(task: dict, all_tags: list) -> str:
+    tag_ids = task.get("tagIds") or []
+    parts = []
+    for tid in tag_ids:
+        tag = next((x for x in all_tags if x["id"] == tid), None)
+        if tag:
+            parts.append(_rich_badge(tag["title"], _hex_color_from(tag)))
+    return " ".join(parts)
+
+
+def _project_rich_name(task: dict, all_projects: list) -> str:
+    pid = task.get("projectId")
+    proj = next((p for p in all_projects if p["id"] == (pid or "INBOX_PROJECT")), None)
+    if proj:
+        return _project_rich_label(proj)
+    return "Inbox" if not pid else "?"
+
+
+def _parse_duration(value: str) -> int:
+    """Parse a duration string like '1h30m', '90m', '2h' into milliseconds."""
+    value = value.strip()
+    m = re.fullmatch(r"(?:(\d+)h)?(?:(\d+)m)?", value)
+    if not m or not m.group(0):
+        console.print(f"[red]Invalid duration '[bold]{value}[/bold]'. Use formats like 1h30m, 90m, or 2h.[/red]")
+        raise typer.Exit(1)
+    hours = int(m.group(1) or 0)
+    minutes = int(m.group(2) or 0)
+    if hours == 0 and minutes == 0:
+        console.print(f"[red]Invalid duration '[bold]{value}[/bold]'. Use formats like 1h30m, 90m, or 2h.[/red]")
+        raise typer.Exit(1)
+    return (hours * 60 + minutes) * 60_000
+
+
+def _parse_due(value: str) -> str:
+    """Resolve 'today', 'tomorrow', or passthrough a YYYY-MM-DD string."""
+    if value == "today":
+        return date.today().strftime("%Y-%m-%d")
+    if value == "tomorrow":
+        return (date.today() + timedelta(days=1)).strftime("%Y-%m-%d")
+    if not re.match(r"\d{4}-\d{2}-\d{2}$", value):
+        console.print(f"[red]Invalid due date '[bold]{value}[/bold]'. Use today, tomorrow, or YYYY-MM-DD.[/red]")
+        raise typer.Exit(1)
+    return value
+
+
 def _format_due(task: dict) -> str:
     ts = task.get("dueWithTime")
     if ts:
@@ -161,9 +246,15 @@ def _resolve_task(query: Optional[str], include_done: bool = False) -> dict:
         raise typer.Exit(1)
 
     all_projects: list = _get("/projects")
-    labels = [
-        f"{t['title']}  [{_project_name(t, all_projects)}]" for t in tasks
-    ]
+    def _task_label(t: dict) -> str:
+        project = _project_name(t, all_projects)
+        due = _format_due(t)
+        suffix = f"  [{project}]" if project else ""
+        if due:
+            suffix += f"  {due}"
+        return f"{t['title']}{suffix}"
+
+    labels = [_task_label(t) for t in tasks]
     prompt = (
         f"Multiple matches for '{query}', pick one:" if query else "Select a task:"
     )
@@ -185,8 +276,8 @@ def add(
         None, "--tag", "-t", help="Tag name (repeat for multiple: -t foo -t bar)"
     ),
     notes: Optional[str] = typer.Option(None, "--notes", "-n", help="Task notes"),
-    today: bool = typer.Option(False, "--today", help="Schedule for today"),
-    due: Optional[str] = typer.Option(None, "--due", "-d", help="Due date (YYYY-MM-DD)"),
+    due: Optional[str] = typer.Option(None, "--due", "-d", help="Due date (today, tomorrow, or YYYY-MM-DD)"),
+    estimate: Optional[str] = typer.Option(None, "--estimate", "-e", help="Time estimate (e.g. 1h30m, 90m, 2h)"),
 ):
     """Create a new task.
 
@@ -208,11 +299,11 @@ def add(
     if notes:
         body["notes"] = notes
     if due:
-        body["dueDay"] = due
+        body["dueDay"] = _parse_due(due)
+    if estimate:
+        body["timeEstimate"] = _parse_duration(estimate)
 
     tag_ids: List[str] = []
-    if today:
-        tag_ids.append("TODAY")
     if tag:
         all_tags: list = _get("/tags")
         for t in tag:
@@ -236,10 +327,42 @@ def add(
         body["tagIds"] = tag_ids
 
     result: dict = _post("/tasks", body)
-    proj_name = _project_name(result, all_projects)
     console.print(
-        f"[green]✓[/green] Created: [bold]{result['title']}[/bold]  [dim]({proj_name})[/dim]"
+        f"[green]✓[/green] Created: [bold]{result['title']}[/bold]  ({_project_rich_name(result, all_projects)})"
     )
+
+
+@app.command()
+def edit(
+    query: Optional[str] = typer.Argument(None, help="Part of the task title to search for"),
+    title: Optional[str] = typer.Option(None, "--title", help="New title"),
+    notes: Optional[str] = typer.Option(None, "--notes", "-n", help="New notes"),
+    due: Optional[str] = typer.Option(None, "--due", "-d", help="Due date (today, tomorrow, or YYYY-MM-DD)"),
+    estimate: Optional[str] = typer.Option(None, "--estimate", "-e", help="Time estimate (e.g. 1h30m, 90m, 2h)"),
+    project: Optional[str] = typer.Option(None, "--project", "-p", help="Move to project (name substring)"),
+):
+    """Edit an existing task."""
+    task = _resolve_task(query)
+
+    body: dict = {}
+    if title:
+        body["title"] = title
+    if notes:
+        body["notes"] = notes
+    if due:
+        body["dueDay"] = _parse_due(due)
+    if estimate:
+        body["timeEstimate"] = _parse_duration(estimate)
+    if project:
+        all_projects: list = _get("/projects")
+        body["projectId"] = _match_project(project, all_projects)
+
+    if not body:
+        console.print("[yellow]Nothing to update. Use --title, --notes, --due, --estimate, or --project.[/yellow]")
+        raise typer.Exit(0)
+
+    _patch(f"/tasks/{task['id']}", body)
+    console.print(f"[green]✓[/green] Updated: [bold]{task['title']}[/bold]")
 
 
 @app.command()
@@ -262,11 +385,14 @@ def list_tasks(
     project: Optional[str] = typer.Option(
         None, "--project", "-p", help="Filter by project name"
     ),
-    today: bool = typer.Option(False, "--today", help="Only today's tasks"),
+    due: Optional[str] = typer.Option(
+        None, "--due", "-d", help="Filter by due date (today, tomorrow, or YYYY-MM-DD)"
+    ),
     done_flag: bool = typer.Option(
         False, "--done", help="Include completed tasks"
     ),
     query: Optional[str] = typer.Option(None, "--query", "-q", help="Filter by title"),
+    archived: bool = typer.Option(False, "--archived", "-a", help="Show archived tasks instead of active"),
 ):
     """List tasks."""
     all_projects: list = _get("/projects")
@@ -274,14 +400,34 @@ def list_tasks(
     params: dict = {}
     if query:
         params["query"] = query
-    if done_flag:
+    if archived:
+        params["source"] = "archived"
         params["includeDone"] = True
-    if today:
-        params["tagId"] = "TODAY"
-    elif project:
+    elif done_flag:
+        params["includeDone"] = True
+    if project:
         params["projectId"] = _match_project(project, all_projects)
 
     tasks: list = _get("/tasks", params)
+    all_tags: list = _get("/tags")
+
+    if due:
+        due_day = _parse_due(due)
+        if archived:
+            tasks = [
+                t for t in tasks
+                if t.get("doneOn")
+                and datetime.fromtimestamp(t["doneOn"] / 1000).strftime("%Y-%m-%d") == due_day
+            ]
+        else:
+            tasks = [
+                t for t in tasks
+                if t.get("dueDay") == due_day
+                or (
+                    t.get("dueWithTime")
+                    and datetime.fromtimestamp(t["dueWithTime"] / 1000).strftime("%Y-%m-%d") == due_day
+                )
+            ]
     tasks.sort(key=lambda t: (
         t["dueWithTime"]
         if t.get("dueWithTime")
@@ -296,7 +442,10 @@ def list_tasks(
 
     table = Table(box=box.SIMPLE, show_header=True, header_style="bold")
     table.add_column("Title", ratio=5)
-    table.add_column("Project", style="cyan", ratio=2)
+    table.add_column("Project", ratio=2)
+    table.add_column("Tags", ratio=2)
+    table.add_column("Est.", style="cyan", ratio=1, no_wrap=True)
+    table.add_column("Spent", style="magenta", ratio=1, no_wrap=True)
     table.add_column("Due", style="yellow", ratio=2, no_wrap=True)
     table.add_column("", ratio=1, justify="center")
 
@@ -304,7 +453,10 @@ def list_tasks(
         done_mark = "[green]✓[/green]" if t.get("isDone") else ""
         table.add_row(
             t["title"],
-            _project_name(t, all_projects),
+            _project_rich_name(t, all_projects),
+            _tags_rich_text(t, all_tags),
+            _fmt_duration(t.get("timeEstimate", 0)),
+            _fmt_duration(t.get("timeSpent", 0)),
             _format_due(t),
             done_mark,
             style="dim" if t.get("isDone") else "",
@@ -322,9 +474,9 @@ def projects():
         console.print("[yellow]No projects found.[/yellow]")
         return
     table = Table(box=box.SIMPLE, show_header=True, header_style="bold")
-    table.add_column("Project", style="cyan")
+    table.add_column("Project")
     for p in all_projects:
-        table.add_row(p["title"])
+        table.add_row(_project_rich_label(p))
     console.print(table)
 
 
