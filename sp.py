@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import re
 import sys
+import textwrap
 from datetime import date, datetime, timedelta
 from typing import List, Optional
 
@@ -21,6 +22,7 @@ import typer
 from rich import box
 from rich.console import Console
 from rich.table import Table
+from rich.text import Text
 
 app = typer.Typer(
     help="Super Productivity CLI",
@@ -177,6 +179,14 @@ def _parse_due(value: str) -> str:
     return value
 
 
+def _wrap_title(title: str, width: int) -> str:
+    """Wrap a title to `width`, indenting continuation lines so they read as
+    part of the same task rather than a new row."""
+    flat = title.replace("\r\n", " ").replace("\n", " ")
+    lines = textwrap.wrap(flat, width=max(width, 10), subsequent_indent="  ") or [""]
+    return "\n".join(lines)
+
+
 def _format_due(task: dict) -> str:
     ts = task.get("dueWithTime")
     if ts:
@@ -252,7 +262,8 @@ def _resolve_task(query: Optional[str], include_done: bool = False) -> dict:
         suffix = f"  [{project}]" if project else ""
         if due:
             suffix += f"  {due}"
-        return f"{t['title']}{suffix}"
+        title = t["title"].replace("\r\n", "\n").replace("\n", " ↵ ")
+        return f"{title}{suffix}"
 
     labels = [_task_label(t) for t in tasks]
     prompt = (
@@ -440,28 +451,52 @@ def list_tasks(
         console.print("[yellow]No tasks found.[/yellow]")
         return
 
-    table = Table(box=box.SIMPLE, show_header=True, header_style="bold")
-    table.add_column("Title", ratio=5)
-    table.add_column("Project", ratio=2)
-    table.add_column("Tags", ratio=2)
-    table.add_column("Est.", style="cyan", ratio=1, no_wrap=True)
-    table.add_column("Spent", style="magenta", ratio=1, no_wrap=True)
-    table.add_column("Due", style="yellow", ratio=2, no_wrap=True)
-    table.add_column("", ratio=1, justify="center", no_wrap=True)
-    table.add_column("", ratio=1, justify="center")
+    # Precompute the fixed-content columns so the Title column can be sized
+    # against whatever space they actually need, and pre-wrapped to match.
+    project_cells = [_project_rich_name(t, all_projects) for t in tasks]
+    tags_cells = [_tags_rich_text(t, all_tags) for t in tasks]
+    est_cells = [_fmt_duration(t.get("timeEstimate", 0)) for t in tasks]
+    spent_cells = [_fmt_duration(t.get("timeSpent", 0)) for t in tasks]
+    due_cells = [_format_due(t) for t in tasks]
+    recurring_cells = ["[blue]↻[/blue]" if t.get("repeatCfgId") else "" for t in tasks]
+    done_cells = ["[green]✓[/green]" if t.get("isDone") else "" for t in tasks]
 
-    for t in tasks:
-        done_mark = "[green]✓[/green]" if t.get("isDone") else ""
-        recurring_mark = "[blue]↻[/blue]" if t.get("repeatCfgId") else ""
+    def _col_w(header: str, cells: List[str]) -> int:
+        return max([len(header)] + [Text.from_markup(c).cell_len for c in cells])
+
+    w_project = _col_w("Project", project_cells)
+    w_tags = _col_w("Tags", tags_cells)
+    w_est = _col_w("Est.", est_cells)
+    w_spent = _col_w("Spent", spent_cells)
+    w_due = _col_w("Due", due_cells)
+    w_recurring = 1
+    w_done = 1
+
+    num_columns = 8
+    overhead = 3 * num_columns + 1  # empirical: per-column padding + table margins
+    other_width = w_project + w_tags + w_est + w_spent + w_due + w_recurring + w_done
+    title_width = max(console.size.width - other_width - overhead, 1)
+
+    table = Table(box=box.SIMPLE, show_header=True, header_style="bold")
+    table.add_column("Title", width=title_width)
+    table.add_column("Project", width=w_project)
+    table.add_column("Tags", width=w_tags)
+    table.add_column("Est.", style="cyan", width=w_est, no_wrap=True)
+    table.add_column("Spent", style="magenta", width=w_spent, no_wrap=True)
+    table.add_column("Due", style="yellow", width=w_due, no_wrap=True)
+    table.add_column("", width=w_recurring, justify="center", no_wrap=True)
+    table.add_column("", width=w_done, justify="center")
+
+    for i, t in enumerate(tasks):
         table.add_row(
-            t["title"],
-            _project_rich_name(t, all_projects),
-            _tags_rich_text(t, all_tags),
-            _fmt_duration(t.get("timeEstimate", 0)),
-            _fmt_duration(t.get("timeSpent", 0)),
-            _format_due(t),
-            recurring_mark,
-            done_mark,
+            _wrap_title(t["title"], title_width),
+            project_cells[i],
+            tags_cells[i],
+            est_cells[i],
+            spent_cells[i],
+            due_cells[i],
+            recurring_cells[i],
+            done_cells[i],
             style="dim" if t.get("isDone") else "",
         )
 
