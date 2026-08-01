@@ -447,10 +447,12 @@ def list_tasks(
     table.add_column("Est.", style="cyan", ratio=1, no_wrap=True)
     table.add_column("Spent", style="magenta", ratio=1, no_wrap=True)
     table.add_column("Due", style="yellow", ratio=2, no_wrap=True)
+    table.add_column("", ratio=1, justify="center", no_wrap=True)
     table.add_column("", ratio=1, justify="center")
 
     for t in tasks:
         done_mark = "[green]✓[/green]" if t.get("isDone") else ""
+        recurring_mark = "[blue]↻[/blue]" if t.get("repeatCfgId") else ""
         table.add_row(
             t["title"],
             _project_rich_name(t, all_projects),
@@ -458,6 +460,7 @@ def list_tasks(
             _fmt_duration(t.get("timeEstimate", 0)),
             _fmt_duration(t.get("timeSpent", 0)),
             _format_due(t),
+            recurring_mark,
             done_mark,
             style="dim" if t.get("isDone") else "",
         )
