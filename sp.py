@@ -33,6 +33,7 @@ console = Console()
 
 BASE_URL = "http://127.0.0.1:3876"
 INBOX_LABEL = "Inbox (no project)"
+MIN_TABLE_WIDTH = 80
 
 
 # ─── HTTP helpers ─────────────────────────────────────────────────────────────
@@ -475,7 +476,11 @@ def list_tasks(
     num_columns = 8
     overhead = 3 * num_columns + 1  # empirical: per-column padding + table margins
     other_width = w_project + w_tags + w_est + w_spent + w_due + w_recurring + w_done
-    title_width = max(console.size.width - other_width - overhead, 1)
+    # Below MIN_TABLE_WIDTH there isn't enough room to lay out all columns
+    # sensibly; render at MIN_TABLE_WIDTH instead and let the terminal soft-wrap.
+    render_width = max(console.size.width, MIN_TABLE_WIDTH)
+    title_width = max(render_width - other_width - overhead, 1)
+    render_console = Console(width=render_width)
 
     table = Table(box=box.SIMPLE, show_header=True, header_style="bold")
     table.add_column("Title", width=title_width)
@@ -500,7 +505,7 @@ def list_tasks(
             style="dim" if t.get("isDone") else "",
         )
 
-    console.print(table)
+    render_console.print(table)
     console.print(f"[dim]{len(tasks)} task(s)[/dim]")
 
 
