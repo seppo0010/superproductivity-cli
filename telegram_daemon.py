@@ -102,6 +102,34 @@ def _next_9am(now: datetime) -> datetime:
     return datetime.combine(target_date, dtime(9, 0))
 
 
+def _today_tasks() -> list:
+    """Active tasks due today, either via dueDay or dueWithTime, sorted by time."""
+    tasks: list = _sp_get("/tasks")
+    today = datetime.now().strftime("%Y-%m-%d")
+    result = []
+    for t in tasks:
+        if t.get("isDone"):
+            continue
+        due_ms = t.get("dueWithTime")
+        if t.get("dueDay") == today:
+            result.append(t)
+        elif due_ms and datetime.fromtimestamp(due_ms / 1000).strftime("%Y-%m-%d") == today:
+            result.append(t)
+    result.sort(key=lambda t: t.get("dueWithTime") or 0)
+    return result
+
+
+def _format_today_message(tasks: list) -> str:
+    if not tasks:
+        return "🎉 No hay tareas para hoy."
+    lines = [f"📋 Tareas de hoy ({len(tasks)})"]
+    for t in tasks:
+        due_ms = t.get("dueWithTime")
+        time_str = datetime.fromtimestamp(due_ms / 1000).strftime("%H:%M") if due_ms else "—"
+        lines.append(f"{time_str}  {t['title']}")
+    return "\n".join(lines)
+
+
 # ─── Telegram API ───────────────────────────────────────────────────────────
 
 def _telegram_call(method: str, **params) -> object:
@@ -250,6 +278,25 @@ def _handle_callback(callback: dict) -> None:
     log.info("Handled '%s' for task %s", action, task_id)
 
 
+def _handle_message(message: dict) -> None:
+    chat_id = message.get("chat", {}).get("id")
+    if str(chat_id) != str(CHAT_ID):
+        return
+    text = (message.get("text") or "").strip().split("@", 1)[0]
+    if text not in ("/hoy", "/today"):
+        return
+
+    try:
+        tasks = _today_tasks()
+    except (requests.RequestException, RuntimeError) as e:
+        log.error("Could not fetch today's tasks: %s", e)
+        _telegram_call("sendMessage", chat_id=chat_id, text=f"Error: {e}")
+        return
+
+    _telegram_call("sendMessage", chat_id=chat_id, text=_format_today_message(tasks))
+    log.info("Sent today's task list (%d task(s)) to chat %s", len(tasks), chat_id)
+
+
 def poll_telegram_updates() -> None:
     state = _load_json(BOT_STATE_FILE, {"offset": 0})
     offset = state.get("offset", 0)
@@ -257,7 +304,8 @@ def poll_telegram_updates() -> None:
     while True:
         try:
             updates = _telegram_call(
-                "getUpdates", offset=offset, timeout=30, allowed_updates=["callback_query"]
+                "getUpdates", offset=offset, timeout=30,
+                allowed_updates=["callback_query", "message"],
             )
         except (requests.RequestException, RuntimeError) as e:
             log.error("getUpdates failed, retrying: %s", e)
@@ -267,11 +315,17 @@ def poll_telegram_updates() -> None:
         for update in updates:
             offset = update["update_id"] + 1
             callback = update.get("callback_query")
+            message = update.get("message")
             if callback:
                 try:
                     _handle_callback(callback)
                 except (requests.RequestException, RuntimeError):
                     log.exception("Unhandled error processing callback")
+            elif message:
+                try:
+                    _handle_message(message)
+                except (requests.RequestException, RuntimeError):
+                    log.exception("Unhandled error processing message")
             _save_json(BOT_STATE_FILE, {"offset": offset})
 
 
@@ -279,6 +333,14 @@ def main() -> None:
     if not TOKEN or not CHAT_ID:
         log.error("TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID must be set in the environment")
         sys.exit(1)
+
+    try:
+        _telegram_call(
+            "setMyCommands",
+            commands=[{"command": "hoy", "description": "Tareas de hoy"}],
+        )
+    except (requests.RequestException, RuntimeError) as e:
+        log.warning("Could not register bot commands: %s", e)
 
     threading.Thread(target=poll_telegram_updates, daemon=True).start()
 
