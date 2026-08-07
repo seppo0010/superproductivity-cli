@@ -35,6 +35,8 @@ CHECK_INTERVAL_SECONDS = 300
 STATE_DIR = Path(os.environ.get("SP_CLI_STATE_DIR", Path.home() / ".config" / "sp-cli"))
 NOTIFY_STATE_FILE = STATE_DIR / "notify_state.json"
 BOT_STATE_FILE = STATE_DIR / "telegram_bot_state.json"
+DAILY_DIGEST_STATE_FILE = STATE_DIR / "daily_digest_state.json"
+DAILY_DIGEST_HOUR = 7
 
 TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
@@ -210,6 +212,36 @@ def check_due_tasks() -> Optional[int]:
     return (next_due_ms - now_ms) // 1000 + 1
 
 
+# ─── Daily digest (main thread, checked alongside due-task check) ──────────
+
+def check_daily_digest() -> None:
+    """Sends the day's task list once per day, the first time the loop runs
+    at or after DAILY_DIGEST_HOUR local time."""
+    now = datetime.now()
+    if now.hour < DAILY_DIGEST_HOUR:
+        return
+
+    today = now.strftime("%Y-%m-%d")
+    state = _load_json(DAILY_DIGEST_STATE_FILE, {"last_sent_date": None})
+    if state.get("last_sent_date") == today:
+        return
+
+    try:
+        tasks = _today_tasks()
+    except (requests.RequestException, RuntimeError) as e:
+        log.error("Could not fetch today's tasks for daily digest: %s", e)
+        return
+
+    try:
+        _telegram_call("sendMessage", chat_id=CHAT_ID, text=_format_today_message(tasks))
+    except (requests.RequestException, RuntimeError) as e:
+        log.error("Failed to send daily digest: %s", e)
+        return
+
+    _save_json(DAILY_DIGEST_STATE_FILE, {"last_sent_date": today})
+    log.info("Sent daily digest (%d task(s))", len(tasks))
+
+
 # ─── Button handling (background thread, continuous) ───────────────────────
 
 def _handle_callback(callback: dict) -> None:
@@ -346,6 +378,7 @@ def main() -> None:
 
     while True:
         next_due_in = check_due_tasks()
+        check_daily_digest()
         sleep_seconds = CHECK_INTERVAL_SECONDS
         if next_due_in is not None:
             sleep_seconds = min(CHECK_INTERVAL_SECONDS, next_due_in)
