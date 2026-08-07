@@ -21,6 +21,7 @@ import requests
 import typer
 from rich import box
 from rich.console import Console
+from rich.progress import track
 from rich.table import Table
 from rich.text import Text
 
@@ -541,6 +542,50 @@ def delete(
             raise typer.Exit(0)
     _delete(f"/tasks/{task['id']}")
     console.print(f"[red]✗[/red] Deleted: [bold]{task['title']}[/bold]")
+
+
+@app.command(name="clear-archived")
+def clear_archived(
+    yes: bool = typer.Option(False, "--yes", "-y", help="Skip confirmation prompt"),
+):
+    """Permanently delete every archived task.
+
+    The REST API has no endpoint to delete archived tasks directly, so each
+    task is restored to active and then deleted immediately after.
+    """
+    tasks: list = _get("/tasks", {"source": "archived", "includeDone": True})
+    if not tasks:
+        console.print("[yellow]No archived tasks found.[/yellow]")
+        return
+
+    if not yes:
+        answer = questionary.confirm(
+            f"Permanently delete all {len(tasks)} archived task(s)? This cannot be undone.",
+            default=False,
+        ).ask()
+        if answer is None or not answer:
+            console.print("[dim]Cancelled.[/dim]")
+            raise typer.Exit(0)
+
+    failures: List[str] = []
+    deleted = 0
+    for t in track(tasks, description="Deleting archived tasks..."):
+        try:
+            r = requests.post(f"{BASE_URL}/tasks/{t['id']}/restore", json={}, timeout=10)
+            if not r.json().get("ok"):
+                raise RuntimeError(r.json().get("error", {}).get("message", "restore failed"))
+            r = requests.delete(f"{BASE_URL}/tasks/{t['id']}", timeout=10)
+            if not r.json().get("ok"):
+                raise RuntimeError(r.json().get("error", {}).get("message", "delete failed"))
+            deleted += 1
+        except (requests.RequestException, RuntimeError) as e:
+            failures.append(f"{t['title']}: {e}")
+
+    console.print(f"[red]✗[/red] Deleted {deleted} archived task(s).")
+    if failures:
+        console.print(f"[yellow]{len(failures)} task(s) could not be deleted:[/yellow]")
+        for f in failures:
+            console.print(f"  [dim]{f}[/dim]")
 
 
 @app.command()
