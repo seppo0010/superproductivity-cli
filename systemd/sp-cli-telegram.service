@@ -1,0 +1,14 @@
+[Unit]
+Description=SP CLI Telegram due-task notifier and button listener
+After=network.target
+
+[Service]
+Type=simple
+Restart=on-failure
+RestartSec=5
+WorkingDirectory=/home/seppo/Documents/superproductivity-cli
+EnvironmentFile=%h/.config/sp-cli/telegram.env
+ExecStart=/home/seppo/.pyenv/shims/python3 /home/seppo/Documents/superproductivity-cli/telegram_daemon.py
+
+[Install]
+WantedBy=default.target
