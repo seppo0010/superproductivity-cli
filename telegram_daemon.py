@@ -132,16 +132,45 @@ def _today_tasks() -> list:
     return result
 
 
+_INBOX_LABEL = "📥 Inbox"
+
+# Super Productivity project icons are either a Material icon name (mapped
+# below to an emoji) or already an emoji (used as-is).
+_PROJECT_ICON_EMOJI = {
+    "inbox": "📥",
+    "newspaper": "📰",
+    "news": "📧",
+    "monitor_heart": "💓",
+    "attach_money": "💵",
+    "balance": "⚖️",
+    "location_city": "🏙️",
+    "robot_2": "🤖",
+    "south_america": "🌎",
+    "other_admission": "📋",
+    "finance_chip": "💰",
+    "computer": "💻",
+}
+_DEFAULT_PROJECT_EMOJI = "📁"
+
+
+def _project_emoji(project: dict) -> str:
+    icon = project.get("icon") or ""
+    if any(ord(ch) > 127 for ch in icon):
+        return icon
+    return _PROJECT_ICON_EMOJI.get(icon, _DEFAULT_PROJECT_EMOJI)
+
+
+def _project_display(project: dict) -> str:
+    return f"{_project_emoji(project)} {project['title']}"
+
+
 def _project_title_map() -> dict:
     try:
         projects: list = _sp_get("/projects")
     except (requests.RequestException, RuntimeError) as e:
         log.warning("Could not fetch projects for task list formatting: %s", e)
         return {}
-    return {p["id"]: p["title"] for p in projects}
-
-
-_INBOX_LABEL = "📥 Inbox"
+    return {p["id"]: _project_display(p) for p in projects}
 
 
 def _format_today_message(tasks: list) -> str:
@@ -319,13 +348,13 @@ def _start_new_task(chat_id, title: str) -> None:
     state[str(chat_id)] = {
         "title": title,
         "project_ids": [p["id"] for p in projects],
-        "project_titles": [p["title"] for p in projects],
+        "project_titles": [_project_display(p) for p in projects],
     }
     _save_json(PENDING_TASK_STATE_FILE, state)
 
     keyboard = {
-        "inline_keyboard": [[{"text": "📥 Inbox", "callback_data": "ntproj:0"}]] + [
-            [{"text": p["title"], "callback_data": f"ntproj:{i + 1}"}]
+        "inline_keyboard": [[{"text": _INBOX_LABEL, "callback_data": "ntproj:0"}]] + [
+            [{"text": _project_display(p), "callback_data": f"ntproj:{i + 1}"}]
             for i, p in enumerate(projects)
         ]
     }
@@ -352,7 +381,7 @@ def _handle_new_task_project(callback_id: str, chat_id, message_id, payload: str
         idx = -1
 
     if idx == 0:
-        project_id, project_title = None, "Inbox"
+        project_id, project_title = None, _INBOX_LABEL
     elif 1 <= idx <= len(project_ids):
         project_id = project_ids[idx - 1]
         project_title = pending["project_titles"][idx - 1]
