@@ -165,11 +165,19 @@ def _format_today_message(tasks: list) -> str:
     return "\n".join(lines)
 
 
+def _hecho_button_label(task: dict, project_map: dict) -> str:
+    due_ms = task.get("dueWithTime")
+    time_str = datetime.fromtimestamp(due_ms / 1000).strftime("%H:%M") if due_ms else "──"
+    project_title = project_map.get(task.get("projectId"), _INBOX_LABEL) if task.get("projectId") else _INBOX_LABEL
+    return f"{time_str} · {project_title} · {task['title']}"
+
+
 def _hecho_keyboard(tasks: list) -> dict:
+    project_map = _project_title_map()
     return {
         "inline_keyboard": [
-            [{"text": t["title"], "callback_data": f"done:{t['id']}"}] for t in tasks
-        ]
+            [{"text": _hecho_button_label(t, project_map), "callback_data": f"done:{t['id']}"}] for t in tasks
+        ] + [[{"text": "❌ Cancelar", "callback_data": "hcancel:0"}]]
     }
 
 
@@ -434,6 +442,10 @@ def _handle_callback(callback: dict) -> None:
         return
     if action == "ntdue":
         _handle_new_task_due(callback_id, chat_id, message_id, payload)
+        return
+    if action == "hcancel":
+        _telegram_call("editMessageText", chat_id=chat_id, message_id=message_id, text="Cancelado")
+        _telegram_call("answerCallbackQuery", callback_query_id=callback_id)
         return
     task_id = payload
 
