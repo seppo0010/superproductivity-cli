@@ -142,6 +142,14 @@ def _format_today_message(tasks: list) -> str:
     return "\n".join(lines)
 
 
+def _hecho_keyboard(tasks: list) -> dict:
+    return {
+        "inline_keyboard": [
+            [{"text": t["title"], "callback_data": f"done:{t['id']}"}] for t in tasks
+        ]
+    }
+
+
 # ─── Telegram API ───────────────────────────────────────────────────────────
 
 def _telegram_call(method: str, **params) -> object:
@@ -465,21 +473,41 @@ def _handle_message(message: dict) -> None:
         return
 
     command = text.split("@", 1)[0]
-    if command not in ("/hoy", "/today"):
-        if text.startswith("/"):
+
+    if command in ("/hoy", "/today"):
+        try:
+            tasks = _today_tasks()
+        except (requests.RequestException, RuntimeError) as e:
+            log.error("Could not fetch today's tasks: %s", e)
+            _telegram_call("sendMessage", chat_id=chat_id, text=f"Error: {e}")
             return
-        _start_new_task(chat_id, text)
+
+        _telegram_call("sendMessage", chat_id=chat_id, text=_format_today_message(tasks))
+        log.info("Sent today's task list (%d task(s)) to chat %s", len(tasks), chat_id)
         return
 
-    try:
-        tasks = _today_tasks()
-    except (requests.RequestException, RuntimeError) as e:
-        log.error("Could not fetch today's tasks: %s", e)
-        _telegram_call("sendMessage", chat_id=chat_id, text=f"Error: {e}")
+    if command == "/hecho":
+        try:
+            tasks = _today_tasks()
+        except (requests.RequestException, RuntimeError) as e:
+            log.error("Could not fetch today's tasks: %s", e)
+            _telegram_call("sendMessage", chat_id=chat_id, text=f"Error: {e}")
+            return
+
+        if not tasks:
+            _telegram_call("sendMessage", chat_id=chat_id, text="🎉 No hay tareas pendientes hoy.")
+            return
+
+        _telegram_call(
+            "sendMessage", chat_id=chat_id, text="¿Qué tarea marcamos como hecha?",
+            reply_markup=_hecho_keyboard(tasks),
+        )
+        log.info("Sent /hecho task picker (%d task(s)) to chat %s", len(tasks), chat_id)
         return
 
-    _telegram_call("sendMessage", chat_id=chat_id, text=_format_today_message(tasks))
-    log.info("Sent today's task list (%d task(s)) to chat %s", len(tasks), chat_id)
+    if text.startswith("/"):
+        return
+    _start_new_task(chat_id, text)
 
 
 def poll_telegram_updates() -> None:
@@ -522,7 +550,10 @@ def main() -> None:
     try:
         _telegram_call(
             "setMyCommands",
-            commands=[{"command": "hoy", "description": "Tareas de hoy"}],
+            commands=[
+                {"command": "hoy", "description": "Tareas de hoy"},
+                {"command": "hecho", "description": "Marcar una tarea de hoy como hecha"},
+            ],
         )
     except (requests.RequestException, RuntimeError) as e:
         log.warning("Could not register bot commands: %s", e)
