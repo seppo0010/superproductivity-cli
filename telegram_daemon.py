@@ -36,6 +36,7 @@ STATE_DIR = Path(os.environ.get("SP_CLI_STATE_DIR", Path.home() / ".config" / "s
 NOTIFY_STATE_FILE = STATE_DIR / "notify_state.json"
 BOT_STATE_FILE = STATE_DIR / "telegram_bot_state.json"
 DAILY_DIGEST_STATE_FILE = STATE_DIR / "daily_digest_state.json"
+PENDING_TASK_STATE_FILE = STATE_DIR / "pending_task_state.json"
 DAILY_DIGEST_HOUR = 7
 
 TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
@@ -77,6 +78,15 @@ def _sp_get(path: str, params: Optional[dict] = None) -> object:
 
 def _sp_patch(path: str, body: dict) -> object:
     r = requests.patch(f"{BASE_URL}{path}", json=body, timeout=10)
+    r.raise_for_status()
+    resp = r.json()
+    if not resp.get("ok"):
+        raise RuntimeError(resp.get("error", {}).get("message", str(resp)))
+    return resp["data"]
+
+
+def _sp_post(path: str, body: dict) -> object:
+    r = requests.post(f"{BASE_URL}{path}", json=body, timeout=10)
     r.raise_for_status()
     resp = r.json()
     if not resp.get("ok"):
@@ -242,6 +252,134 @@ def check_daily_digest() -> None:
     log.info("Sent daily digest (%d task(s))", len(tasks))
 
 
+# ─── New-task flow (plain messages start a project/due-date prompt) ────────
+
+_DUE_DATE_KEYBOARD = {
+    "inline_keyboard": [
+        [
+            {"text": "Hoy", "callback_data": "ntdue:today"},
+            {"text": "Mañana", "callback_data": "ntdue:tomorrow"},
+        ],
+        [{"text": "Sin fecha", "callback_data": "ntdue:none"}],
+    ]
+}
+
+
+def _start_new_task(chat_id, title: str) -> None:
+    try:
+        projects: list = _sp_get("/projects")
+    except (requests.RequestException, RuntimeError) as e:
+        log.error("Could not fetch projects: %s", e)
+        _telegram_call("sendMessage", chat_id=chat_id, text=f"Error: {e}")
+        return
+    projects = [p for p in projects if not p.get("isHiddenFromMenu") and not p.get("isArchived")]
+
+    state = _load_json(PENDING_TASK_STATE_FILE, {})
+    state[str(chat_id)] = {
+        "title": title,
+        "project_ids": [p["id"] for p in projects],
+        "project_titles": [p["title"] for p in projects],
+    }
+    _save_json(PENDING_TASK_STATE_FILE, state)
+
+    keyboard = {
+        "inline_keyboard": [[{"text": "📥 Inbox", "callback_data": "ntproj:0"}]] + [
+            [{"text": p["title"], "callback_data": f"ntproj:{i + 1}"}]
+            for i, p in enumerate(projects)
+        ]
+    }
+    _telegram_call(
+        "sendMessage", chat_id=chat_id, text=f"📝 {title}\n¿En qué proyecto?", reply_markup=keyboard
+    )
+    log.info("Started new-task flow for chat %s: %s", chat_id, title)
+
+
+def _handle_new_task_project(callback_id: str, chat_id, message_id, payload: str) -> None:
+    state = _load_json(PENDING_TASK_STATE_FILE, {})
+    pending = state.get(str(chat_id))
+    if not pending:
+        _telegram_call(
+            "answerCallbackQuery", callback_query_id=callback_id,
+            text="No hay ninguna tarea pendiente", show_alert=True,
+        )
+        return
+
+    project_ids = pending.get("project_ids", [])
+    try:
+        idx = int(payload)
+    except ValueError:
+        idx = -1
+
+    if idx == 0:
+        project_id, project_title = None, "Inbox"
+    elif 1 <= idx <= len(project_ids):
+        project_id = project_ids[idx - 1]
+        project_title = pending["project_titles"][idx - 1]
+    else:
+        _telegram_call(
+            "answerCallbackQuery", callback_query_id=callback_id,
+            text="Opción inválida", show_alert=True,
+        )
+        return
+
+    pending["project_id"] = project_id
+    pending["project_title"] = project_title
+    state[str(chat_id)] = pending
+    _save_json(PENDING_TASK_STATE_FILE, state)
+
+    _telegram_call(
+        "editMessageText", chat_id=chat_id, message_id=message_id,
+        text=f"📝 {pending['title']}\nProyecto: {project_title}\n¿Vencimiento?",
+        reply_markup=_DUE_DATE_KEYBOARD,
+    )
+    _telegram_call("answerCallbackQuery", callback_query_id=callback_id)
+
+
+def _handle_new_task_due(callback_id: str, chat_id, message_id, payload: str) -> None:
+    state = _load_json(PENDING_TASK_STATE_FILE, {})
+    pending = state.pop(str(chat_id), None)
+    _save_json(PENDING_TASK_STATE_FILE, state)
+
+    if not pending or "project_title" not in pending:
+        _telegram_call(
+            "answerCallbackQuery", callback_query_id=callback_id,
+            text="No hay ninguna tarea pendiente", show_alert=True,
+        )
+        return
+
+    due_day = None
+    due_label = "Sin fecha"
+    if payload == "today":
+        due_day = datetime.now().strftime("%Y-%m-%d")
+        due_label = "Hoy"
+    elif payload == "tomorrow":
+        due_day = (datetime.now() + timedelta(days=1)).strftime("%Y-%m-%d")
+        due_label = "Mañana"
+
+    body: dict = {"title": pending["title"]}
+    if pending.get("project_id"):
+        body["projectId"] = pending["project_id"]
+    if due_day:
+        body["dueDay"] = due_day
+
+    try:
+        _sp_post("/tasks", body)
+    except (requests.RequestException, RuntimeError) as e:
+        log.error("Could not create task: %s", e)
+        _telegram_call("editMessageText", chat_id=chat_id, message_id=message_id, text=f"Error: {e}")
+        _telegram_call(
+            "answerCallbackQuery", callback_query_id=callback_id, text="Error", show_alert=True
+        )
+        return
+
+    _telegram_call(
+        "editMessageText", chat_id=chat_id, message_id=message_id,
+        text=f"✅ Creada: {pending['title']}\nProyecto: {pending['project_title']}\nVencimiento: {due_label}",
+    )
+    _telegram_call("answerCallbackQuery", callback_query_id=callback_id, text="Creada")
+    log.info("Created task '%s' for chat %s", pending["title"], chat_id)
+
+
 # ─── Button handling (background thread, continuous) ───────────────────────
 
 def _handle_callback(callback: dict) -> None:
@@ -252,11 +390,19 @@ def _handle_callback(callback: dict) -> None:
     message_id = message.get("message_id")
 
     try:
-        action, task_id = data.split(":", 1)
+        action, payload = data.split(":", 1)
     except ValueError:
         log.warning("Malformed callback_data: %s", data)
         _telegram_call("answerCallbackQuery", callback_query_id=callback_id)
         return
+
+    if action == "ntproj":
+        _handle_new_task_project(callback_id, chat_id, message_id, payload)
+        return
+    if action == "ntdue":
+        _handle_new_task_due(callback_id, chat_id, message_id, payload)
+        return
+    task_id = payload
 
     try:
         task = _find_task(task_id)
@@ -314,8 +460,15 @@ def _handle_message(message: dict) -> None:
     chat_id = message.get("chat", {}).get("id")
     if str(chat_id) != str(CHAT_ID):
         return
-    text = (message.get("text") or "").strip().split("@", 1)[0]
-    if text not in ("/hoy", "/today"):
+    text = (message.get("text") or "").strip()
+    if not text:
+        return
+
+    command = text.split("@", 1)[0]
+    if command not in ("/hoy", "/today"):
+        if text.startswith("/"):
+            return
+        _start_new_task(chat_id, text)
         return
 
     try:
