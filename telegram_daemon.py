@@ -16,6 +16,7 @@ Prerequisites:
 
 from __future__ import annotations
 
+import html
 import json
 import logging
 import os
@@ -131,14 +132,36 @@ def _today_tasks() -> list:
     return result
 
 
+def _project_title_map() -> dict:
+    try:
+        projects: list = _sp_get("/projects")
+    except (requests.RequestException, RuntimeError) as e:
+        log.warning("Could not fetch projects for task list formatting: %s", e)
+        return {}
+    return {p["id"]: p["title"] for p in projects}
+
+
+_INBOX_LABEL = "📥 Inbox"
+
+
 def _format_today_message(tasks: list) -> str:
     if not tasks:
         return "🎉 No hay tareas para hoy."
-    lines = [f"📋 Tareas de hoy ({len(tasks)})"]
+
+    project_map = _project_title_map()
+    groups: dict[str, list] = {}
     for t in tasks:
-        due_ms = t.get("dueWithTime")
-        time_str = datetime.fromtimestamp(due_ms / 1000).strftime("%H:%M") if due_ms else "—"
-        lines.append(f"{time_str}  {t['title']}")
+        project_title = project_map.get(t.get("projectId"), _INBOX_LABEL) if t.get("projectId") else _INBOX_LABEL
+        groups.setdefault(project_title, []).append(t)
+
+    lines = [f"📋 <b>Tareas de hoy</b> ({len(tasks)})"]
+    for project_title in sorted(groups, key=lambda p: (p == _INBOX_LABEL, p)):
+        lines.append("")
+        lines.append(f"<b>{html.escape(project_title)}</b>")
+        for t in groups[project_title]:
+            due_ms = t.get("dueWithTime")
+            time_str = datetime.fromtimestamp(due_ms / 1000).strftime("%H:%M") if due_ms else "──"
+            lines.append(f"🕐 {time_str}  {html.escape(t['title'])}")
     return "\n".join(lines)
 
 
@@ -251,7 +274,9 @@ def check_daily_digest() -> None:
         return
 
     try:
-        _telegram_call("sendMessage", chat_id=CHAT_ID, text=_format_today_message(tasks))
+        _telegram_call(
+            "sendMessage", chat_id=CHAT_ID, text=_format_today_message(tasks), parse_mode="HTML"
+        )
     except (requests.RequestException, RuntimeError) as e:
         log.error("Failed to send daily digest: %s", e)
         return
@@ -482,7 +507,9 @@ def _handle_message(message: dict) -> None:
             _telegram_call("sendMessage", chat_id=chat_id, text=f"Error: {e}")
             return
 
-        _telegram_call("sendMessage", chat_id=chat_id, text=_format_today_message(tasks))
+        _telegram_call(
+            "sendMessage", chat_id=chat_id, text=_format_today_message(tasks), parse_mode="HTML"
+        )
         log.info("Sent today's task list (%d task(s)) to chat %s", len(tasks), chat_id)
         return
 
