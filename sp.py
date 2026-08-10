@@ -5,6 +5,11 @@ Prerequisites:
   • VIKUNJA_URL set to the base URL of your Vikunja instance (e.g. http://192.168.0.9:3456)
   • VIKUNJA_TOKEN set to an API token (Vikunja → Settings → API Tokens)
 
+Both can also live in ~/.config/sp-cli/telegram.env (the same file the
+Telegram daemon reads via systemd's EnvironmentFile=) — it's loaded as a
+fallback for any of these vars not already set in the environment, so an
+interactive shell alias doesn't need to export them itself.
+
 Tip: alias sp='python /path/to/sp.py'
 """
 
@@ -15,6 +20,7 @@ import re
 import sys
 import textwrap
 from datetime import date, datetime, timedelta, timezone
+from pathlib import Path
 from typing import List, Optional
 
 import questionary
@@ -32,6 +38,24 @@ app = typer.Typer(
     no_args_is_help=True,
 )
 console = Console()
+
+
+def _load_env_file(path: Path) -> None:
+    """Fill in os.environ from a KEY=VALUE file for any key not already set,
+    so vars already exported in the shell always take precedence."""
+    try:
+        lines = path.read_text().splitlines()
+    except OSError:
+        return
+    for line in lines:
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        os.environ.setdefault(key.strip(), value.strip())
+
+
+_load_env_file(Path.home() / ".config" / "sp-cli" / "telegram.env")
 
 VIKUNJA_URL = os.environ.get("VIKUNJA_URL", "http://192.168.0.9:3456").rstrip("/")
 API_BASE = f"{VIKUNJA_URL}/api/v1"
