@@ -58,6 +58,7 @@ NOTIFY_STATE_FILE = STATE_DIR / "notify_state.json"
 BOT_STATE_FILE = STATE_DIR / "telegram_bot_state.json"
 DAILY_DIGEST_STATE_FILE = STATE_DIR / "daily_digest_state.json"
 PENDING_TASK_STATE_FILE = STATE_DIR / "pending_task_state.json"
+UNDO_STATE_FILE = STATE_DIR / "undo_state.json"
 DAILY_DIGEST_HOUR = 7
 
 TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
@@ -606,6 +607,56 @@ def _handle_new_task_due(callback_id: str, chat_id, message_id, payload: str) ->
 
 # ─── Button handling (background thread, continuous) ───────────────────────
 
+def _handle_undo(callback_id: str, chat_id, message_id, payload: str) -> None:
+    with _state_lock:
+        state = _load_json(UNDO_STATE_FILE, {})
+        entry = state.pop(payload, None)
+        _save_json(UNDO_STATE_FILE, state)
+
+    if not entry:
+        _telegram_call(
+            "answerCallbackQuery", callback_query_id=callback_id,
+            text="Ya no se puede deshacer", show_alert=True,
+        )
+        return
+
+    prev_task = entry["task"]
+    try:
+        if entry["action"] == "delete":
+            body = {
+                "title": prev_task["title"],
+                "description": prev_task.get("description") or "",
+                "due_date": prev_task.get("due_date") or "",
+                "priority": prev_task.get("priority") or 0,
+            }
+            created = _vk_put(f"/projects/{prev_task['project_id']}/tasks", body)
+            for label in prev_task.get("labels") or []:
+                _vk_put(f"/tasks/{created['id']}/labels", {"label_id": label["id"]})
+            result_text = f"↩️ {prev_task['title']} — restaurada"
+        else:
+            # done/snooze* only ever touch these two fields, so restoring
+            # both from the pre-action snapshot reverses any of them.
+            _vk_task_update(prev_task["id"], {
+                "done": prev_task.get("done", False),
+                "due_date": prev_task.get("due_date") or "",
+            })
+            result_text = f"↩️ {prev_task['title']} — deshecho"
+    except requests.RequestException as e:
+        log.error("Could not undo action for task %s: %s", payload, e)
+        _telegram_call(
+            "answerCallbackQuery", callback_query_id=callback_id,
+            text=f"Error: {e}", show_alert=True,
+        )
+        return
+
+    try:
+        _telegram_call("editMessageText", chat_id=chat_id, message_id=message_id, text=result_text)
+    except (requests.RequestException, RuntimeError) as e:
+        log.error("Could not edit Telegram message: %s", e)
+    _telegram_call("answerCallbackQuery", callback_query_id=callback_id, text="Deshecho")
+    log.info("Undid '%s' for task %s", entry["action"], payload)
+
+
 def _handle_callback(callback: dict) -> None:
     callback_id = callback["id"]
     data = callback.get("data", "")
@@ -629,6 +680,9 @@ def _handle_callback(callback: dict) -> None:
     if action == "hcancel":
         _telegram_call("editMessageText", chat_id=chat_id, message_id=message_id, text="Cancelado")
         _telegram_call("answerCallbackQuery", callback_query_id=callback_id)
+        return
+    if action == "undo":
+        _handle_undo(callback_id, chat_id, message_id, payload)
         return
     task_id = int(payload)
 
@@ -679,8 +733,16 @@ def _handle_callback(callback: dict) -> None:
         )
         return
 
+    with _state_lock:
+        state = _load_json(UNDO_STATE_FILE, {})
+        state[str(task_id)] = {"action": action, "task": task}
+        _save_json(UNDO_STATE_FILE, state)
+
     try:
-        _telegram_call("editMessageText", chat_id=chat_id, message_id=message_id, text=result_text)
+        _telegram_call(
+            "editMessageText", chat_id=chat_id, message_id=message_id, text=result_text,
+            reply_markup={"inline_keyboard": [[{"text": "↩️ Deshacer", "callback_data": f"undo:{task_id}"}]]},
+        )
     except (requests.RequestException, RuntimeError) as e:
         log.error("Could not edit Telegram message: %s", e)
     _telegram_call("answerCallbackQuery", callback_query_id=callback_id, text="Listo")
