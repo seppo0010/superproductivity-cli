@@ -100,10 +100,27 @@ def _vk_unwrap(r: requests.Response) -> object:
 
 
 def _vk_get(path: str, params: Optional[dict] = None) -> object:
+    """GET, following pagination when the response is a list. Vikunja caps
+    per_page server-side (observed: 50) regardless of what's requested, so
+    a single request silently drops later items — fetch every page."""
     params = dict(params or {})
     params.setdefault("per_page", 250)
-    r = requests.get(f"{API_BASE}{path}", params=params, headers=_vk_headers(), timeout=10)
-    return _vk_unwrap(r)
+    page = 1
+    results = None
+    while True:
+        params["page"] = page
+        r = requests.get(f"{API_BASE}{path}", params=params, headers=_vk_headers(), timeout=10)
+        body = _vk_unwrap(r)
+        if not isinstance(body, list):
+            return body
+        if results is None:
+            results = body
+        else:
+            results.extend(body)
+        total_pages = int(r.headers.get("x-pagination-total-pages", 1))
+        if page >= total_pages or not body:
+            return results
+        page += 1
 
 
 def _vk_put(path: str, body: dict) -> object:
@@ -146,6 +163,21 @@ def _parse_vikunja_ts(ds: str) -> Optional[datetime]:
         return None
     y, mo, d, h, mi, s = (int(g) for g in m.groups())
     return datetime(y, mo, d, h, mi, s, tzinfo=timezone.utc)
+
+
+def _local_time_to_iso(day: date, hour: int, minute: int) -> str:
+    """Convert a local wall-clock time on `day` to a UTC ISO timestamp."""
+    local_dt = datetime(day.year, day.month, day.day, hour, minute, 0).astimezone()
+    return local_dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _day_to_due_iso(day: date) -> str:
+    """A day-only due date is stored as 23:59 local time converted to UTC —
+    Vikunja's own convention for date-only due dates (it has no native
+    date-only field). Using literal UTC midnight instead (the convention for
+    already-migrated SP data) displays as the previous evening in Vikunja's
+    own UI for negative-UTC-offset timezones."""
+    return _local_time_to_iso(day, 23, 59)
 
 
 def _task_due_dt(task: dict) -> Optional[datetime]:
@@ -544,10 +576,10 @@ def _handle_new_task_due(callback_id: str, chat_id, message_id, payload: str) ->
     due_date_iso = None
     due_label = "Sin fecha"
     if payload == "today":
-        due_date_iso = date.today().strftime("%Y-%m-%dT00:00:00Z")
+        due_date_iso = _day_to_due_iso(date.today())
         due_label = "Hoy"
     elif payload == "tomorrow":
-        due_date_iso = (date.today() + timedelta(days=1)).strftime("%Y-%m-%dT00:00:00Z")
+        due_date_iso = _local_time_to_iso(date.today() + timedelta(days=1), 9, 0)
         due_label = "Mañana"
 
     body: dict = {"title": pending["title"]}

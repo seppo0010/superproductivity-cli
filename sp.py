@@ -102,16 +102,34 @@ def _unwrap(r: requests.Response) -> object:
 
 
 def _get(path: str, params: Optional[dict] = None) -> object:
+    """GET, following pagination when the response is a list. Vikunja caps
+    per_page server-side (observed: 50) regardless of what's requested, so
+    a single request silently drops later items — fetch every page."""
     _require_token()
     params = dict(params or {})
     params.setdefault("per_page", 250)
-    try:
-        return _unwrap(requests.get(f"{API_BASE}{path}", params=params, headers=_headers(), timeout=10))
-    except requests.ConnectionError:
-        _connection_error()
-    except requests.Timeout:
-        console.print("[red]Request timed out.[/red]")
-        raise typer.Exit(1)
+    page = 1
+    results = None
+    while True:
+        params["page"] = page
+        try:
+            r = requests.get(f"{API_BASE}{path}", params=params, headers=_headers(), timeout=10)
+        except requests.ConnectionError:
+            _connection_error()
+        except requests.Timeout:
+            console.print("[red]Request timed out.[/red]")
+            raise typer.Exit(1)
+        body = _unwrap(r)
+        if not isinstance(body, list):
+            return body
+        if results is None:
+            results = body
+        else:
+            results.extend(body)
+        total_pages = int(r.headers.get("x-pagination-total-pages", 1))
+        if page >= total_pages or not body:
+            return results
+        page += 1
 
 
 def _put(path: str, body: dict) -> object:
@@ -197,11 +215,29 @@ def _parse_due(value: str) -> str:
     return value
 
 
+def _local_time_to_iso(day: str, hour: int, minute: int) -> str:
+    """Convert a local wall-clock time on `day` to a UTC ISO timestamp."""
+    y, mo, d = (int(p) for p in day.split("-"))
+    local_dt = datetime(y, mo, d, hour, minute, 0).astimezone()
+    return local_dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
 def _due_day_to_iso(day: str) -> str:
-    """A day-only due date is stored as literal UTC midnight (matching the
-    convention used by the existing migrated data), not a timezone-converted
-    local midnight."""
-    return f"{day}T00:00:00Z"
+    """A day-only due date is stored as 23:59 local time converted to UTC —
+    Vikunja's own convention for date-only due dates (it has no native
+    date-only field). Using literal UTC midnight instead (the convention for
+    already-migrated SP data) displays as the previous evening in Vikunja's
+    own UI for negative-UTC-offset timezones."""
+    return _local_time_to_iso(day, 23, 59)
+
+
+def _due_value_to_iso(value: str) -> str:
+    """'tomorrow' schedules at 9am local (a concrete time worth a
+    notification); 'today' and explicit dates stay day-only (23:59 local
+    marker, no specific time)."""
+    if value == "tomorrow":
+        return _local_time_to_iso((date.today() + timedelta(days=1)).strftime("%Y-%m-%d"), 9, 0)
+    return _due_day_to_iso(_parse_due(value))
 
 
 def _parse_vikunja_ts(ds: str) -> Optional[datetime]:
@@ -361,7 +397,7 @@ def add(
     if notes:
         body["description"] = notes
     if due:
-        body["due_date"] = _due_day_to_iso(_parse_due(due))
+        body["due_date"] = _due_value_to_iso(due)
 
     result: dict = _put(f"/projects/{project_id}/tasks", body)
 
@@ -408,7 +444,7 @@ def edit(
     if notes:
         changes["description"] = notes
     if due:
-        changes["due_date"] = _due_day_to_iso(_parse_due(due))
+        changes["due_date"] = _due_value_to_iso(due)
     if project:
         all_projects: list = _get("/projects")
         changes["project_id"] = _match_project(project, all_projects)
@@ -470,8 +506,18 @@ def list_tasks(
         tasks = [t for t in tasks if _format_due(t)[:10] == due_day]
 
     def _sort_key(t: dict):
+        """Chronological by due instant, but the 23:59-local "no specific
+        time" marker sorts as if due at the start of that local day (like
+        the UTC-midnight day-only convention), not at its literal time."""
         dt = _parse_vikunja_ts(t.get("due_date", ""))
-        return dt.timestamp() if dt else float("inf")
+        if dt is None:
+            return float("inf")
+        if (dt.hour, dt.minute, dt.second) == (0, 0, 0):
+            return dt.timestamp()
+        local = dt.astimezone()
+        if (local.hour, local.minute) == (23, 59):
+            return datetime(local.year, local.month, local.day, tzinfo=timezone.utc).timestamp()
+        return dt.timestamp()
     tasks.sort(key=_sort_key)
 
     if not tasks:
