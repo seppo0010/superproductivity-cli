@@ -195,12 +195,15 @@ def _today_tasks() -> list:
 
 
 _INBOX_LABEL = "📥 Inbox"
-_DEFAULT_PROJECT_EMOJI = "📁"
 
 
 def _project_display(project: dict) -> str:
-    emoji = "📥" if project["title"] == "Inbox" else _DEFAULT_PROJECT_EMOJI
-    return f"{emoji} {project['title']}"
+    """Vikunja has no dedicated emoji field for projects, so emoji are
+    embedded directly in the title (e.g. "🌱Vivir") except for the built-in
+    Inbox project, which stays plain and gets one prepended here."""
+    if project["title"] == "Inbox":
+        return f"📥 {project['title']}"
+    return project["title"]
 
 
 def _real_projects() -> list:
