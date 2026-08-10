@@ -149,11 +149,17 @@ def _parse_vikunja_ts(ds: str) -> Optional[datetime]:
 
 
 def _task_due_dt(task: dict) -> Optional[datetime]:
-    """The due datetime for tasks with an explicit time-of-day. Day-only due
-    dates (stored as literal UTC midnight) are never considered "overdue"
-    here — only tasks with a specific due time can trigger a notification."""
+    """The due datetime for tasks with an explicit time-of-day. Never
+    considered "overdue" (or shown with a time) for either of the two
+    "no specific time" conventions in use: the literal-UTC-midnight sentinel
+    from migrated data, and 23:59 local time — used for tasks created
+    directly in Vikunja, which has no native date-only due date, as a
+    "due sometime today" marker."""
     dt = _parse_vikunja_ts(task.get("due_date", ""))
     if dt is None or (dt.hour, dt.minute, dt.second) == (0, 0, 0):
+        return None
+    local = dt.astimezone()
+    if (local.hour, local.minute) == (23, 59):
         return None
     return dt
 

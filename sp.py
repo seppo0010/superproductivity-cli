@@ -222,13 +222,24 @@ def _wrap_title(title: str, width: int) -> str:
     return "\n".join(lines)
 
 
-def _format_due(task: dict) -> str:
-    dt = _parse_vikunja_ts(task.get("due_date", ""))
+def _format_dt_due(dt: Optional[datetime]) -> str:
+    """Format a due datetime for display, hiding the time-of-day for the two
+    "no specific time" conventions in use: the literal-UTC-midnight sentinel
+    from migrated data, and 23:59 local time — used for tasks created
+    directly in Vikunja, which has no native date-only due date, as a
+    "due sometime today" marker."""
     if dt is None:
         return ""
     if (dt.hour, dt.minute, dt.second) == (0, 0, 0):
         return dt.strftime("%Y-%m-%d")
-    return dt.astimezone().strftime("%Y-%m-%d %H:%M")
+    local = dt.astimezone()
+    if (local.hour, local.minute) == (23, 59):
+        return local.strftime("%Y-%m-%d")
+    return local.strftime("%Y-%m-%d %H:%M")
+
+
+def _format_due(task: dict) -> str:
+    return _format_dt_due(_parse_vikunja_ts(task.get("due_date", "")))
 
 
 def _match_project(name: str, all_projects: list) -> int:
@@ -568,10 +579,7 @@ def punt(
     new_iso = new_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
     _task_update(task["id"], {"due_date": new_iso})
 
-    if (new_dt.hour, new_dt.minute, new_dt.second) == (0, 0, 0):
-        label = new_dt.strftime("%Y-%m-%d")
-    else:
-        label = new_dt.astimezone().strftime("%Y-%m-%d %H:%M")
+    label = _format_dt_due(new_dt)
     console.print(f"[green]✓[/green] Punted: [bold]{task['title']}[/bold]  → {label}")
 
 
