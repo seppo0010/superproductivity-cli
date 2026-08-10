@@ -1,37 +1,57 @@
 #!/usr/bin/env python3
-"""Telegram daemon for sp-cli.
+"""Telegram daemon for sp-cli, backed by Vikunja.
 
-Runs two loops in one process:
-  • Main thread: checks Super Productivity for tasks that just became
-    overdue and sends a Telegram message per task with action buttons (mark
-    done, snooze). Polls at most every 5 minutes, but wakes up sooner when a
-    task is already scheduled to become due before then.
-  • Background thread: long-polls Telegram for button presses and applies
-    them to Super Productivity via the Local REST API.
+Runs three things in one process:
+  • A webhook receiver (background thread) that Vikunja POSTs to on
+    task.overdue / tasks.overdue events (a user-level webhook you register
+    yourself in Vikunja — see README). This is the fast path for "a task
+    just became overdue" notifications.
+  • Main thread: a safety-net reconciliation pass that re-checks for any
+    overdue task not yet notified, in case a webhook delivery was missed
+    (daemon downtime, network blip). Runs at most every
+    CHECK_INTERVAL_SECONDS, but wakes up sooner when a task is already
+    scheduled to become due before then.
+  • Background thread: long-polls Telegram for button presses and commands
+    and applies them to Vikunja via its REST API.
 
 Prerequisites:
-  • Super Productivity desktop app running with the Local REST API enabled
+  • VIKUNJA_URL, VIKUNJA_TOKEN set in the environment (API token from
+    Vikunja → Settings → API Tokens)
+  • VIKUNJA_WEBHOOK_SECRET set to the secret used when you registered the
+    user-level webhook (Vikunja → user settings → Webhooks) pointing at
+    http://<this-host>:VIKUNJA_WEBHOOK_PORT/webhook, events task.overdue
+    and tasks.overdue
   • TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID set in the environment
 """
 
 from __future__ import annotations
 
+import hashlib
+import hmac
 import html
+import http.server
 import json
 import logging
 import os
+import re
 import sys
 import threading
 import time
-from datetime import datetime, timedelta, time as dtime
+from datetime import date, datetime, timedelta, timezone, time as dtime
 from pathlib import Path
 from typing import Optional
 
 import requests
 
-BASE_URL = "http://127.0.0.1:3876"
+VIKUNJA_URL = os.environ.get("VIKUNJA_URL", "http://192.168.0.9:3456").rstrip("/")
+API_BASE = f"{VIKUNJA_URL}/api/v1"
+VIKUNJA_TOKEN = os.environ.get("VIKUNJA_TOKEN")
+WEBHOOK_SECRET = os.environ.get("VIKUNJA_WEBHOOK_SECRET")
+WEBHOOK_HOST = os.environ.get("VIKUNJA_WEBHOOK_HOST", "0.0.0.0")
+WEBHOOK_PORT = int(os.environ.get("VIKUNJA_WEBHOOK_PORT", "8765"))
+
 TELEGRAM_API = "https://api.telegram.org/bot{token}/{method}"
-CHECK_INTERVAL_SECONDS = 300
+CHECK_INTERVAL_SECONDS = 1800  # safety-net reconciliation cadence
 
 STATE_DIR = Path(os.environ.get("SP_CLI_STATE_DIR", Path.home() / ".config" / "sp-cli"))
 NOTIFY_STATE_FILE = STATE_DIR / "notify_state.json"
@@ -47,6 +67,8 @@ logging.basicConfig(
     level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s", stream=sys.stdout
 )
 log = logging.getLogger("sp-cli-telegram")
+
+_state_lock = threading.Lock()
 
 
 # ─── State ──────────────────────────────────────────────────────────────────
@@ -66,48 +88,90 @@ def _save_json(path: Path, data: dict) -> None:
     path.write_text(json.dumps(data))
 
 
-# ─── Super Productivity API ─────────────────────────────────────────────────
+# ─── Vikunja API ─────────────────────────────────────────────────────────────
 
-def _sp_get(path: str, params: Optional[dict] = None) -> object:
-    r = requests.get(f"{BASE_URL}{path}", params=params, timeout=10)
+def _vk_headers() -> dict:
+    return {"Authorization": f"Bearer {VIKUNJA_TOKEN}"}
+
+
+def _vk_unwrap(r: requests.Response) -> object:
     r.raise_for_status()
-    body = r.json()
-    if not body.get("ok"):
-        raise RuntimeError(body.get("error", {}).get("message", str(body)))
-    return body["data"]
+    return r.json()
 
 
-def _sp_patch(path: str, body: dict) -> object:
-    r = requests.patch(f"{BASE_URL}{path}", json=body, timeout=10)
-    r.raise_for_status()
-    resp = r.json()
-    if not resp.get("ok"):
-        raise RuntimeError(resp.get("error", {}).get("message", str(resp)))
-    return resp["data"]
+def _vk_get(path: str, params: Optional[dict] = None) -> object:
+    params = dict(params or {})
+    params.setdefault("per_page", 250)
+    r = requests.get(f"{API_BASE}{path}", params=params, headers=_vk_headers(), timeout=10)
+    return _vk_unwrap(r)
 
 
-def _sp_post(path: str, body: dict) -> object:
-    r = requests.post(f"{BASE_URL}{path}", json=body, timeout=10)
-    r.raise_for_status()
-    resp = r.json()
-    if not resp.get("ok"):
-        raise RuntimeError(resp.get("error", {}).get("message", str(resp)))
-    return resp["data"]
+def _vk_put(path: str, body: dict) -> object:
+    r = requests.put(f"{API_BASE}{path}", json=body, headers=_vk_headers(), timeout=10)
+    return _vk_unwrap(r)
 
 
-def _find_task(task_id: str) -> Optional[dict]:
-    tasks: list = _sp_get("/tasks", {"includeDone": True})
-    return next((t for t in tasks if t["id"] == task_id), None)
+def _vk_post(path: str, body: dict) -> object:
+    r = requests.post(f"{API_BASE}{path}", json=body, headers=_vk_headers(), timeout=10)
+    return _vk_unwrap(r)
 
 
-def _task_due_ms(task: dict) -> Optional[int]:
-    # dueDay-only tasks (no time of day) are never considered overdue here —
-    # only tasks with an explicit dueWithTime can trigger a notification.
-    return task.get("dueWithTime")
+def _vk_delete(path: str) -> object:
+    r = requests.delete(f"{API_BASE}{path}", headers=_vk_headers(), timeout=10)
+    return _vk_unwrap(r)
+
+
+def _vk_task_update(task_id: int, changes: dict) -> dict:
+    """Fetch-merge-write: Vikunja's task update resets fields omitted from
+    the request body, so a naive partial PATCH silently destroys data."""
+    current: dict = _vk_get(f"/tasks/{task_id}")
+    current.update(changes)
+    return _vk_post(f"/tasks/{task_id}", current)
+
+
+def _find_task(task_id) -> Optional[dict]:
+    try:
+        return _vk_get(f"/tasks/{task_id}")
+    except requests.HTTPError as e:
+        if e.response is not None and e.response.status_code == 404:
+            return None
+        raise
+
+
+def _parse_vikunja_ts(ds: str) -> Optional[datetime]:
+    if not ds or ds.startswith("0001-01-01"):
+        return None
+    m = re.match(r"(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})", ds)
+    if not m:
+        return None
+    y, mo, d, h, mi, s = (int(g) for g in m.groups())
+    return datetime(y, mo, d, h, mi, s, tzinfo=timezone.utc)
+
+
+def _task_due_dt(task: dict) -> Optional[datetime]:
+    """The due datetime for tasks with an explicit time-of-day. Day-only due
+    dates (stored as literal UTC midnight) are never considered "overdue"
+    here — only tasks with a specific due time can trigger a notification."""
+    dt = _parse_vikunja_ts(task.get("due_date", ""))
+    if dt is None or (dt.hour, dt.minute, dt.second) == (0, 0, 0):
+        return None
+    return dt
+
+
+def _task_local_date(task: dict) -> Optional[date]:
+    dt = _parse_vikunja_ts(task.get("due_date", ""))
+    if dt is None:
+        return None
+    if (dt.hour, dt.minute, dt.second) == (0, 0, 0):
+        return dt.date()
+    return dt.astimezone().date()
 
 
 def _format_due(task: dict) -> str:
-    return datetime.fromtimestamp(task["dueWithTime"] / 1000).strftime("%Y-%m-%d %H:%M")
+    dt = _task_due_dt(task)
+    if dt is None:
+        return ""
+    return dt.astimezone().strftime("%Y-%m-%d %H:%M")
 
 
 def _next_9am(now: datetime) -> datetime:
@@ -116,61 +180,37 @@ def _next_9am(now: datetime) -> datetime:
 
 
 def _today_tasks() -> list:
-    """Active tasks due today, either via dueDay or dueWithTime, sorted by time."""
-    tasks: list = _sp_get("/tasks")
-    today = datetime.now().strftime("%Y-%m-%d")
-    result = []
-    for t in tasks:
-        if t.get("isDone"):
-            continue
-        due_ms = t.get("dueWithTime")
-        if t.get("dueDay") == today:
-            result.append(t)
-        elif due_ms and datetime.fromtimestamp(due_ms / 1000).strftime("%Y-%m-%d") == today:
-            result.append(t)
-    result.sort(key=lambda t: t.get("dueWithTime") or 0)
+    """Active tasks due today, sorted by time (day-only tasks first)."""
+    tasks: list = _vk_get("/tasks", {"filter": "done = false"})
+    today = date.today()
+    result = [t for t in tasks if _task_local_date(t) == today]
+    result.sort(key=lambda t: (_task_due_dt(t) or datetime.min.replace(tzinfo=timezone.utc)))
     return result
 
 
 _INBOX_LABEL = "📥 Inbox"
-
-# Super Productivity project icons are either a Material icon name (mapped
-# below to an emoji) or already an emoji (used as-is).
-_PROJECT_ICON_EMOJI = {
-    "inbox": "📥",
-    "newspaper": "📰",
-    "news": "📧",
-    "monitor_heart": "💓",
-    "attach_money": "💵",
-    "balance": "⚖️",
-    "location_city": "🏙️",
-    "robot_2": "🤖",
-    "south_america": "🌎",
-    "other_admission": "📋",
-    "finance_chip": "💰",
-    "computer": "💻",
-}
 _DEFAULT_PROJECT_EMOJI = "📁"
 
 
-def _project_emoji(project: dict) -> str:
-    icon = project.get("icon") or ""
-    if any(ord(ch) > 127 for ch in icon):
-        return icon
-    return _PROJECT_ICON_EMOJI.get(icon, _DEFAULT_PROJECT_EMOJI)
-
-
 def _project_display(project: dict) -> str:
-    return f"{_project_emoji(project)} {project['title']}"
+    emoji = "📥" if project["title"] == "Inbox" else _DEFAULT_PROJECT_EMOJI
+    return f"{emoji} {project['title']}"
+
+
+def _real_projects() -> list:
+    """Projects tasks can actually be created in — excludes archived
+    projects and Vikunja's virtual saved-filter pseudo-projects (negative
+    ids, e.g. "My Open Tasks")."""
+    try:
+        projects: list = _vk_get("/projects")
+    except requests.RequestException as e:
+        log.warning("Could not fetch projects: %s", e)
+        return []
+    return [p for p in projects if p["id"] > 0 and not p.get("is_archived")]
 
 
 def _project_title_map() -> dict:
-    try:
-        projects: list = _sp_get("/projects")
-    except (requests.RequestException, RuntimeError) as e:
-        log.warning("Could not fetch projects for task list formatting: %s", e)
-        return {}
-    return {p["id"]: _project_display(p) for p in projects}
+    return {p["id"]: _project_display(p) for p in _real_projects()}
 
 
 def _format_today_message(tasks: list) -> str:
@@ -180,7 +220,7 @@ def _format_today_message(tasks: list) -> str:
     project_map = _project_title_map()
     groups: dict[str, list] = {}
     for t in tasks:
-        project_title = project_map.get(t.get("projectId"), _INBOX_LABEL) if t.get("projectId") else _INBOX_LABEL
+        project_title = project_map.get(t.get("project_id"), _INBOX_LABEL)
         groups.setdefault(project_title, []).append(t)
 
     lines = [f"📋 <b>Tareas de hoy</b> ({len(tasks)})"]
@@ -188,24 +228,24 @@ def _format_today_message(tasks: list) -> str:
         lines.append("")
         lines.append(f"<b>{html.escape(project_title)}</b>")
         for t in groups[project_title]:
-            due_ms = t.get("dueWithTime")
-            time_str = datetime.fromtimestamp(due_ms / 1000).strftime("%H:%M") if due_ms else "──"
+            due_dt = _task_due_dt(t)
+            time_str = due_dt.astimezone().strftime("%H:%M") if due_dt else "──"
             lines.append(f"🕐 {time_str}  {html.escape(t['title'])}")
     return "\n".join(lines)
 
 
 def _hecho_button_label(task: dict, project_map: dict) -> str:
-    due_ms = task.get("dueWithTime")
-    time_str = datetime.fromtimestamp(due_ms / 1000).strftime("%H:%M") if due_ms else "──"
-    project_title = project_map.get(task.get("projectId"), _INBOX_LABEL) if task.get("projectId") else _INBOX_LABEL
+    due_dt = _task_due_dt(task)
+    time_str = due_dt.astimezone().strftime("%H:%M") if due_dt else "──"
+    project_title = project_map.get(task.get("project_id"), _INBOX_LABEL)
     return f"{time_str} · {project_title} · {task['title']}"
 
 
-def _hecho_keyboard(tasks: list) -> dict:
+def _task_picker_keyboard(tasks: list, action: str) -> dict:
     project_map = _project_title_map()
     return {
         "inline_keyboard": [
-            [{"text": _hecho_button_label(t, project_map), "callback_data": f"done:{t['id']}"}] for t in tasks
+            [{"text": _hecho_button_label(t, project_map), "callback_data": f"{action}:{t['id']}"}] for t in tasks
         ] + [[{"text": "❌ Cancelar", "callback_data": "hcancel:0"}]]
     }
 
@@ -242,55 +282,135 @@ def _send_due_notification(task: dict) -> bool:
         return False
 
 
-# ─── Due-task check (main thread, every 5 min) ──────────────────────────────
+# ─── Overdue notification state (shared between webhook + reconciliation) ──
+
+def _notify_if_new(task: dict, notified: set) -> None:
+    tid = task["id"]
+    if tid in notified or task.get("done"):
+        return
+    if _send_due_notification(task):
+        notified.add(tid)
+
+
+# ─── Webhook receiver (background thread, push path) ────────────────────────
+
+def _verify_signature(raw_body: bytes, signature: str) -> bool:
+    if not WEBHOOK_SECRET:
+        return True
+    mac = hmac.new(WEBHOOK_SECRET.encode(), raw_body, hashlib.sha256).hexdigest()
+    return hmac.compare_digest(mac, signature or "")
+
+
+def _extract_tasks_from_webhook_data(data: dict) -> list:
+    if isinstance(data.get("task"), dict):
+        return [data["task"]]
+    if isinstance(data.get("tasks"), list):
+        return data["tasks"]
+    return []
+
+
+def _handle_webhook_payload(payload: dict) -> None:
+    event = payload.get("event_name", "")
+    data = payload.get("data") or {}
+    log.info("Webhook event received: %s", event)
+
+    if event not in ("task.overdue", "tasks.overdue"):
+        return
+
+    tasks = _extract_tasks_from_webhook_data(data)
+    if not tasks:
+        log.warning("Overdue webhook event %s had no recognizable task(s) in payload: %s", event, json.dumps(data)[:2000])
+        return
+
+    with _state_lock:
+        state = _load_json(NOTIFY_STATE_FILE, {"notified_ids": []})
+        notified = set(state.get("notified_ids", []))
+        for t in tasks:
+            _notify_if_new(t, notified)
+        _save_json(NOTIFY_STATE_FILE, {"notified_ids": sorted(notified)})
+
+
+class _WebhookHandler(http.server.BaseHTTPRequestHandler):
+    def do_POST(self):
+        if self.path != "/webhook":
+            self.send_response(404)
+            self.end_headers()
+            return
+        length = int(self.headers.get("Content-Length", 0))
+        raw = self.rfile.read(length)
+        signature = self.headers.get("X-Vikunja-Signature", "")
+        if not _verify_signature(raw, signature):
+            log.warning("Webhook signature mismatch, ignoring request")
+            self.send_response(401)
+            self.end_headers()
+            return
+        self.send_response(200)
+        self.end_headers()
+        try:
+            _handle_webhook_payload(json.loads(raw))
+        except (json.JSONDecodeError, KeyError, TypeError):
+            log.exception("Could not parse webhook payload")
+
+    def log_message(self, format, *args):
+        log.info("webhook: " + format, *args)
+
+
+def _run_webhook_server() -> None:
+    server = http.server.ThreadingHTTPServer((WEBHOOK_HOST, WEBHOOK_PORT), _WebhookHandler)
+    log.info("Webhook receiver listening on %s:%d", WEBHOOK_HOST, WEBHOOK_PORT)
+    server.serve_forever()
+
+
+# ─── Reconciliation pass (main thread, safety net) ──────────────────────────
 
 def check_due_tasks() -> Optional[int]:
-    """Sends notifications for newly-overdue tasks. Returns the number of
-    seconds until the next task with a known due time becomes due (so the
-    caller can wake up sooner instead of waiting the full poll interval),
-    or None if there's no upcoming due time to wait for."""
+    """Safety net for missed webhook deliveries: sends notifications for any
+    newly-overdue task not already notified. Returns the number of seconds
+    until the next task with a known due time becomes due (so the caller can
+    wake up sooner instead of waiting the full poll interval), or None if
+    there's no upcoming due time to wait for."""
     try:
-        tasks: list = _sp_get("/tasks")
-    except (requests.RequestException, RuntimeError) as e:
+        tasks: list = _vk_get("/tasks", {"filter": "done = false"})
+    except requests.RequestException as e:
         log.error("Could not fetch tasks: %s", e)
         return None
 
-    now_ms = int(time.time() * 1000)
+    now = datetime.now(timezone.utc)
     overdue = {}
-    next_due_ms = None
+    next_due_in = None
     for t in tasks:
-        if t.get("isDone"):
+        due_dt = _task_due_dt(t)
+        if due_dt is None:
             continue
-        due = _task_due_ms(t)
-        if due is None:
-            continue
-        if due <= now_ms:
+        if due_dt <= now:
             overdue[t["id"]] = t
-        elif next_due_ms is None or due < next_due_ms:
-            next_due_ms = due
+        else:
+            seconds = (due_dt - now).total_seconds()
+            if next_due_in is None or seconds < next_due_in:
+                next_due_in = seconds
 
-    state = _load_json(NOTIFY_STATE_FILE, {"notified_ids": []})
-    notified = set(state.get("notified_ids", []))
+    with _state_lock:
+        state = _load_json(NOTIFY_STATE_FILE, {"notified_ids": []})
+        notified = set(state.get("notified_ids", []))
 
-    new_ids = [tid for tid in overdue if tid not in notified]
-    for tid in new_ids:
-        if _send_due_notification(overdue[tid]):
-            notified.add(tid)
+        new_ids = [tid for tid in overdue if tid not in notified]
+        for tid in new_ids:
+            _notify_if_new(overdue[tid], notified)
 
-    notified &= overdue.keys()
-    _save_json(NOTIFY_STATE_FILE, {"notified_ids": sorted(notified)})
+        notified &= overdue.keys()
+        _save_json(NOTIFY_STATE_FILE, {"notified_ids": sorted(notified)})
 
     if new_ids:
-        log.info("Notified %d newly overdue task(s)", len(new_ids))
+        log.info("Reconciliation notified %d newly overdue task(s)", len(new_ids))
     else:
-        log.info("Checked %d active task(s), none newly overdue", len(tasks))
+        log.info("Reconciliation checked %d active task(s), none newly overdue", len(tasks))
 
-    if next_due_ms is None:
+    if next_due_in is None:
         return None
-    return (next_due_ms - now_ms) // 1000 + 1
+    return int(next_due_in) + 1
 
 
-# ─── Daily digest (main thread, checked alongside due-task check) ──────────
+# ─── Daily digest (main thread, checked alongside reconciliation) ──────────
 
 def check_daily_digest() -> None:
     """Sends the day's task list once per day, the first time the loop runs
@@ -306,7 +426,7 @@ def check_daily_digest() -> None:
 
     try:
         tasks = _today_tasks()
-    except (requests.RequestException, RuntimeError) as e:
+    except requests.RequestException as e:
         log.error("Could not fetch today's tasks for daily digest: %s", e)
         return
 
@@ -336,13 +456,10 @@ _DUE_DATE_KEYBOARD = {
 
 
 def _start_new_task(chat_id, title: str) -> None:
-    try:
-        projects: list = _sp_get("/projects")
-    except (requests.RequestException, RuntimeError) as e:
-        log.error("Could not fetch projects: %s", e)
-        _telegram_call("sendMessage", chat_id=chat_id, text=f"Error: {e}")
+    projects = _real_projects()
+    if not projects:
+        _telegram_call("sendMessage", chat_id=chat_id, text="Error: no se pudieron obtener los proyectos")
         return
-    projects = [p for p in projects if not p.get("isHiddenFromMenu") and not p.get("isArchived")]
 
     state = _load_json(PENDING_TASK_STATE_FILE, {})
     state[str(chat_id)] = {
@@ -353,8 +470,8 @@ def _start_new_task(chat_id, title: str) -> None:
     _save_json(PENDING_TASK_STATE_FILE, state)
 
     keyboard = {
-        "inline_keyboard": [[{"text": _INBOX_LABEL, "callback_data": "ntproj:0"}]] + [
-            [{"text": _project_display(p), "callback_data": f"ntproj:{i + 1}"}]
+        "inline_keyboard": [
+            [{"text": _project_display(p), "callback_data": f"ntproj:{i}"}]
             for i, p in enumerate(projects)
         ]
     }
@@ -380,11 +497,9 @@ def _handle_new_task_project(callback_id: str, chat_id, message_id, payload: str
     except ValueError:
         idx = -1
 
-    if idx == 0:
-        project_id, project_title = None, _INBOX_LABEL
-    elif 1 <= idx <= len(project_ids):
-        project_id = project_ids[idx - 1]
-        project_title = pending["project_titles"][idx - 1]
+    if 0 <= idx < len(project_ids):
+        project_id = project_ids[idx]
+        project_title = pending["project_titles"][idx]
     else:
         _telegram_call(
             "answerCallbackQuery", callback_query_id=callback_id,
@@ -417,24 +532,22 @@ def _handle_new_task_due(callback_id: str, chat_id, message_id, payload: str) ->
         )
         return
 
-    due_day = None
+    due_date_iso = None
     due_label = "Sin fecha"
     if payload == "today":
-        due_day = datetime.now().strftime("%Y-%m-%d")
+        due_date_iso = date.today().strftime("%Y-%m-%dT00:00:00Z")
         due_label = "Hoy"
     elif payload == "tomorrow":
-        due_day = (datetime.now() + timedelta(days=1)).strftime("%Y-%m-%d")
+        due_date_iso = (date.today() + timedelta(days=1)).strftime("%Y-%m-%dT00:00:00Z")
         due_label = "Mañana"
 
     body: dict = {"title": pending["title"]}
-    if pending.get("project_id"):
-        body["projectId"] = pending["project_id"]
-    if due_day:
-        body["dueDay"] = due_day
+    if due_date_iso:
+        body["due_date"] = due_date_iso
 
     try:
-        _sp_post("/tasks", body)
-    except (requests.RequestException, RuntimeError) as e:
+        _vk_put(f"/projects/{pending['project_id']}/tasks", body)
+    except requests.RequestException as e:
         log.error("Could not create task: %s", e)
         _telegram_call("editMessageText", chat_id=chat_id, message_id=message_id, text=f"Error: {e}")
         _telegram_call(
@@ -476,11 +589,11 @@ def _handle_callback(callback: dict) -> None:
         _telegram_call("editMessageText", chat_id=chat_id, message_id=message_id, text="Cancelado")
         _telegram_call("answerCallbackQuery", callback_query_id=callback_id)
         return
-    task_id = payload
+    task_id = int(payload)
 
     try:
         task = _find_task(task_id)
-    except (requests.RequestException, RuntimeError) as e:
+    except requests.RequestException as e:
         log.error("Could not fetch task %s: %s", task_id, e)
         _telegram_call(
             "answerCallbackQuery", callback_query_id=callback_id,
@@ -498,23 +611,26 @@ def _handle_callback(callback: dict) -> None:
 
     try:
         if action == "done":
-            _sp_patch(f"/tasks/{task_id}", {"isDone": True})
+            _vk_task_update(task_id, {"done": True})
             result_text = f"✅ {task['title']} — hecha"
+        elif action == "delete":
+            _vk_delete(f"/tasks/{task_id}")
+            result_text = f"🗑️ {task['title']} — borrada"
         elif action in ("snooze10", "snooze60"):
-            delta_ms = 10 * 60_000 if action == "snooze10" else 60 * 60_000
-            new_ts = int(time.time() * 1000) + delta_ms
-            _sp_patch(f"/tasks/{task_id}", {"dueWithTime": new_ts})
-            result_text = f"⏰ {task['title']} — pospuesta a las {datetime.fromtimestamp(new_ts / 1000).strftime('%H:%M')}"
+            delta = timedelta(minutes=10) if action == "snooze10" else timedelta(hours=1)
+            new_dt = datetime.now(timezone.utc) + delta
+            _vk_task_update(task_id, {"due_date": new_dt.strftime("%Y-%m-%dT%H:%M:%SZ")})
+            result_text = f"⏰ {task['title']} — pospuesta a las {new_dt.astimezone().strftime('%H:%M')}"
         elif action == "snooze9am":
             target = _next_9am(datetime.now())
-            new_ts = int(target.timestamp() * 1000)
-            _sp_patch(f"/tasks/{task_id}", {"dueWithTime": new_ts})
+            new_dt = target.astimezone(timezone.utc)
+            _vk_task_update(task_id, {"due_date": new_dt.strftime("%Y-%m-%dT%H:%M:%SZ")})
             result_text = f"⏰ {task['title']} — pospuesta a {target.strftime('%Y-%m-%d %H:%M')}"
         else:
             log.warning("Unknown action: %s", action)
             _telegram_call("answerCallbackQuery", callback_query_id=callback_id)
             return
-    except (requests.RequestException, RuntimeError) as e:
+    except requests.RequestException as e:
         log.error("Could not apply action %s to task %s: %s", action, task_id, e)
         _telegram_call(
             "answerCallbackQuery", callback_query_id=callback_id,
@@ -543,7 +659,7 @@ def _handle_message(message: dict) -> None:
     if command in ("/hoy", "/today"):
         try:
             tasks = _today_tasks()
-        except (requests.RequestException, RuntimeError) as e:
+        except requests.RequestException as e:
             log.error("Could not fetch today's tasks: %s", e)
             _telegram_call("sendMessage", chat_id=chat_id, text=f"Error: {e}")
             return
@@ -557,7 +673,7 @@ def _handle_message(message: dict) -> None:
     if command == "/hecho":
         try:
             tasks = _today_tasks()
-        except (requests.RequestException, RuntimeError) as e:
+        except requests.RequestException as e:
             log.error("Could not fetch today's tasks: %s", e)
             _telegram_call("sendMessage", chat_id=chat_id, text=f"Error: {e}")
             return
@@ -568,9 +684,28 @@ def _handle_message(message: dict) -> None:
 
         _telegram_call(
             "sendMessage", chat_id=chat_id, text="¿Qué tarea marcamos como hecha?",
-            reply_markup=_hecho_keyboard(tasks),
+            reply_markup=_task_picker_keyboard(tasks, "done"),
         )
         log.info("Sent /hecho task picker (%d task(s)) to chat %s", len(tasks), chat_id)
+        return
+
+    if command == "/borrar":
+        try:
+            tasks = _today_tasks()
+        except requests.RequestException as e:
+            log.error("Could not fetch today's tasks: %s", e)
+            _telegram_call("sendMessage", chat_id=chat_id, text=f"Error: {e}")
+            return
+
+        if not tasks:
+            _telegram_call("sendMessage", chat_id=chat_id, text="🎉 No hay tareas pendientes hoy.")
+            return
+
+        _telegram_call(
+            "sendMessage", chat_id=chat_id, text="¿Qué tarea borramos?",
+            reply_markup=_task_picker_keyboard(tasks, "delete"),
+        )
+        log.info("Sent /borrar task picker (%d task(s)) to chat %s", len(tasks), chat_id)
         return
 
     if text.startswith("/"):
@@ -614,6 +749,11 @@ def main() -> None:
     if not TOKEN or not CHAT_ID:
         log.error("TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID must be set in the environment")
         sys.exit(1)
+    if not VIKUNJA_TOKEN:
+        log.error("VIKUNJA_TOKEN must be set in the environment")
+        sys.exit(1)
+    if not WEBHOOK_SECRET:
+        log.warning("VIKUNJA_WEBHOOK_SECRET not set — incoming webhooks will not be signature-verified")
 
     try:
         _telegram_call(
@@ -621,12 +761,14 @@ def main() -> None:
             commands=[
                 {"command": "hoy", "description": "Tareas de hoy"},
                 {"command": "hecho", "description": "Marcar una tarea de hoy como hecha"},
+                {"command": "borrar", "description": "Borrar una tarea de hoy"},
             ],
         )
     except (requests.RequestException, RuntimeError) as e:
         log.warning("Could not register bot commands: %s", e)
 
     threading.Thread(target=poll_telegram_updates, daemon=True).start()
+    threading.Thread(target=_run_webhook_server, daemon=True).start()
 
     while True:
         next_due_in = check_due_tasks()

@@ -1,19 +1,20 @@
 #!/usr/bin/env python3
-"""Super Productivity CLI — wraps the Local REST API at http://127.0.0.1:3876
+"""Vikunja CLI — wraps the Vikunja REST API
 
 Prerequisites:
-  • Super Productivity desktop app must be running
-  • Enable the Local REST API: Settings → Misc → Enable local REST API
+  • VIKUNJA_URL set to the base URL of your Vikunja instance (e.g. http://192.168.0.9:3456)
+  • VIKUNJA_TOKEN set to an API token (Vikunja → Settings → API Tokens)
 
 Tip: alias sp='python /path/to/sp.py'
 """
 
 from __future__ import annotations
 
+import os
 import re
 import sys
 import textwrap
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from typing import List, Optional
 
 import questionary
@@ -26,40 +27,62 @@ from rich.table import Table
 from rich.text import Text
 
 app = typer.Typer(
-    help="Super Productivity CLI",
+    help="Vikunja CLI",
     add_completion=False,
     no_args_is_help=True,
 )
 console = Console()
 
-BASE_URL = "http://127.0.0.1:3876"
-INBOX_LABEL = "Inbox (no project)"
+VIKUNJA_URL = os.environ.get("VIKUNJA_URL", "http://192.168.0.9:3456").rstrip("/")
+API_BASE = f"{VIKUNJA_URL}/api/v1"
+TOKEN = os.environ.get("VIKUNJA_TOKEN")
+INBOX_PROJECT_TITLE = "Inbox"
 MIN_TABLE_WIDTH = 80
 
 
 # ─── HTTP helpers ─────────────────────────────────────────────────────────────
 
+def _require_token() -> None:
+    if not TOKEN:
+        console.print(
+            "[bold red]VIKUNJA_TOKEN is not set.[/bold red]\n"
+            "  • Create an API token in Vikunja → Settings → API Tokens\n"
+            "  • export VIKUNJA_TOKEN=... (and VIKUNJA_URL if not http://192.168.0.9:3456)"
+        )
+        raise typer.Exit(1)
+
+
+def _headers() -> dict:
+    return {"Authorization": f"Bearer {TOKEN}"}
+
+
 def _connection_error() -> None:
     console.print(
-        "[bold red]Cannot reach Super Productivity.[/bold red]\n"
-        "  • Is the desktop app running?\n"
-        "  • Enable via: [bold]Settings → Misc → Enable local REST API[/bold]"
+        "[bold red]Cannot reach Vikunja.[/bold red]\n"
+        f"  • Is it running at [bold]{VIKUNJA_URL}[/bold]?\n"
+        "  • Check VIKUNJA_URL and VIKUNJA_TOKEN."
     )
     raise typer.Exit(1)
 
 
 def _unwrap(r: requests.Response) -> object:
-    body = r.json()
-    if not body.get("ok"):
-        err = body.get("error", {})
-        console.print(f"[red]API error:[/red] {err.get('message', str(body))}")
+    if r.status_code >= 400:
+        try:
+            err = r.json()
+            message = err.get("message", str(err))
+        except ValueError:
+            message = r.text
+        console.print(f"[red]API error:[/red] {message}")
         raise typer.Exit(1)
-    return body["data"]
+    return r.json()
 
 
 def _get(path: str, params: Optional[dict] = None) -> object:
+    _require_token()
+    params = dict(params or {})
+    params.setdefault("per_page", 250)
     try:
-        return _unwrap(requests.get(f"{BASE_URL}{path}", params=params, timeout=10))
+        return _unwrap(requests.get(f"{API_BASE}{path}", params=params, headers=_headers(), timeout=10))
     except requests.ConnectionError:
         _connection_error()
     except requests.Timeout:
@@ -67,53 +90,52 @@ def _get(path: str, params: Optional[dict] = None) -> object:
         raise typer.Exit(1)
 
 
-def _post(path: str, body: dict) -> object:
+def _put(path: str, body: dict) -> object:
+    _require_token()
     try:
-        return _unwrap(requests.post(f"{BASE_URL}{path}", json=body, timeout=10))
+        return _unwrap(requests.put(f"{API_BASE}{path}", json=body, headers=_headers(), timeout=10))
     except requests.ConnectionError:
         _connection_error()
 
 
-def _patch(path: str, body: dict) -> object:
+def _api_post(path: str, body: dict) -> object:
+    _require_token()
     try:
-        return _unwrap(requests.patch(f"{BASE_URL}{path}", json=body, timeout=10))
+        return _unwrap(requests.post(f"{API_BASE}{path}", json=body, headers=_headers(), timeout=10))
     except requests.ConnectionError:
         _connection_error()
 
 
 def _delete(path: str) -> object:
+    _require_token()
     try:
-        return _unwrap(requests.delete(f"{BASE_URL}{path}", timeout=10))
+        return _unwrap(requests.delete(f"{API_BASE}{path}", headers=_headers(), timeout=10))
     except requests.ConnectionError:
         _connection_error()
+
+
+def _task_update(task_id: int, changes: dict) -> dict:
+    """Fetch the full task, apply `changes` on top, and write the whole object
+    back. Vikunja's task update endpoint resets fields that are omitted from
+    the request body rather than leaving them untouched, so a naive partial
+    PATCH silently destroys data (e.g. priority)."""
+    current: dict = _get(f"/tasks/{task_id}")
+    current.update(changes)
+    return _api_post(f"/tasks/{task_id}", current)
 
 
 # ─── Project helpers ──────────────────────────────────────────────────────────
 
 def _project_name(task: dict, all_projects: list) -> str:
-    pid = task.get("projectId")
-    if not pid:
-        return "Inbox"
+    pid = task.get("project_id")
     return next((p["title"] for p in all_projects if p["id"] == pid), "?")
 
 
 def _hex_color_from(obj: dict) -> Optional[str]:
-    """Extract a hex color from a tag or project dict (color field, then theme.primary)."""
-    direct = obj.get("color")
-    if direct and re.match(r"#[0-9a-fA-F]{6}$", direct):
-        return direct
-    primary = obj.get("theme", {}).get("primary", "")
-    m = re.match(r"rgb\(\s*(\d+),\s*(\d+),\s*(\d+)\s*\)", primary)
-    if m:
-        r, g, b = int(m.group(1)), int(m.group(2)), int(m.group(3))
-        return f"#{r:02x}{g:02x}{b:02x}"
-    if re.match(r"#[0-9a-fA-F]{6}$", primary):
-        return primary
+    color = (obj.get("hex_color") or "").lstrip("#")
+    if re.fullmatch(r"[0-9a-fA-F]{6}", color):
+        return f"#{color}"
     return None
-
-
-def _project_hex_color(project: dict) -> Optional[str]:
-    return _hex_color_from(project)
 
 
 def _rich_badge(name: str, color: Optional[str]) -> str:
@@ -125,48 +147,18 @@ def _rich_badge(name: str, color: Optional[str]) -> str:
 
 
 def _project_rich_label(project: dict) -> str:
-    return _rich_badge(project["title"], _project_hex_color(project))
+    return _rich_badge(project["title"], _hex_color_from(project))
 
 
-def _fmt_duration(ms: int) -> str:
-    if not ms:
-        return ""
-    total_min = ms // 60_000
-    h, m = divmod(total_min, 60)
-    return f"{h}h {m:02d}m" if h else f"{m}m"
-
-
-def _tags_rich_text(task: dict, all_tags: list) -> str:
-    tag_ids = task.get("tagIds") or []
-    parts = []
-    for tid in tag_ids:
-        tag = next((x for x in all_tags if x["id"] == tid), None)
-        if tag:
-            parts.append(_rich_badge(tag["title"], _hex_color_from(tag)))
-    return " ".join(parts)
+def _labels_rich_text(task: dict) -> str:
+    labels = task.get("labels") or []
+    return " ".join(_rich_badge(l["title"], _hex_color_from(l)) for l in labels)
 
 
 def _project_rich_name(task: dict, all_projects: list) -> str:
-    pid = task.get("projectId")
-    proj = next((p for p in all_projects if p["id"] == (pid or "INBOX_PROJECT")), None)
-    if proj:
-        return _project_rich_label(proj)
-    return "Inbox" if not pid else "?"
-
-
-def _parse_duration(value: str) -> int:
-    """Parse a duration string like '1h30m', '90m', '2h' into milliseconds."""
-    value = value.strip()
-    m = re.fullmatch(r"(?:(\d+)h)?(?:(\d+)m)?", value)
-    if not m or not m.group(0):
-        console.print(f"[red]Invalid duration '[bold]{value}[/bold]'. Use formats like 1h30m, 90m, or 2h.[/red]")
-        raise typer.Exit(1)
-    hours = int(m.group(1) or 0)
-    minutes = int(m.group(2) or 0)
-    if hours == 0 and minutes == 0:
-        console.print(f"[red]Invalid duration '[bold]{value}[/bold]'. Use formats like 1h30m, 90m, or 2h.[/red]")
-        raise typer.Exit(1)
-    return (hours * 60 + minutes) * 60_000
+    pid = task.get("project_id")
+    proj = next((p for p in all_projects if p["id"] == pid), None)
+    return _project_rich_label(proj) if proj else "?"
 
 
 def _parse_due(value: str) -> str:
@@ -181,6 +173,23 @@ def _parse_due(value: str) -> str:
     return value
 
 
+def _due_day_to_iso(day: str) -> str:
+    """A day-only due date is stored as literal UTC midnight (matching the
+    convention used by the existing migrated data), not a timezone-converted
+    local midnight."""
+    return f"{day}T00:00:00Z"
+
+
+def _parse_vikunja_ts(ds: str) -> Optional[datetime]:
+    if not ds or ds.startswith("0001-01-01"):
+        return None
+    m = re.match(r"(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})", ds)
+    if not m:
+        return None
+    y, mo, d, h, mi, s = (int(g) for g in m.groups())
+    return datetime(y, mo, d, h, mi, s, tzinfo=timezone.utc)
+
+
 def _wrap_title(title: str, width: int) -> str:
     """Wrap a title to `width`, indenting continuation lines so they read as
     part of the same task rather than a new row."""
@@ -190,13 +199,15 @@ def _wrap_title(title: str, width: int) -> str:
 
 
 def _format_due(task: dict) -> str:
-    ts = task.get("dueWithTime")
-    if ts:
-        return datetime.fromtimestamp(ts / 1000).strftime("%Y-%m-%d %H:%M")
-    return task.get("dueDay") or ""
+    dt = _parse_vikunja_ts(task.get("due_date", ""))
+    if dt is None:
+        return ""
+    if (dt.hour, dt.minute, dt.second) == (0, 0, 0):
+        return dt.strftime("%Y-%m-%d")
+    return dt.astimezone().strftime("%Y-%m-%d %H:%M")
 
 
-def _match_project(name: str, all_projects: list) -> str:
+def _match_project(name: str, all_projects: list) -> int:
     """Return a project ID from a name substring. Interactive picker if ambiguous."""
     hits = [p for p in all_projects if name.lower() in p["title"].lower()]
     if not hits:
@@ -216,17 +227,22 @@ def _match_project(name: str, all_projects: list) -> str:
     return next(p["id"] for p in hits if p["title"] == chosen)
 
 
-def _pick_project(all_projects: list) -> Optional[str]:
-    """Interactive project picker. Returns project ID, or None for Inbox."""
+def _pick_project(all_projects: list) -> int:
+    """Interactive project picker. Returns project ID."""
     chosen = questionary.select(
         "Choose a project:",
-        choices=[INBOX_LABEL] + [p["title"] for p in all_projects],
+        choices=[p["title"] for p in all_projects],
     ).ask()
     if chosen is None:
         raise typer.Exit(0)
-    if chosen == INBOX_LABEL:
-        return None
     return next(p["id"] for p in all_projects if p["title"] == chosen)
+
+
+def _default_project_id(all_projects: list) -> int:
+    return next(
+        (p["id"] for p in all_projects if p["title"] == INBOX_PROJECT_TITLE),
+        all_projects[0]["id"],
+    )
 
 
 # ─── Task resolution ──────────────────────────────────────────────────────────
@@ -236,9 +252,9 @@ def _resolve_task(query: Optional[str], include_done: bool = False) -> dict:
     is_tty = sys.stdin.isatty()
     params: dict = {}
     if query:
-        params["query"] = query
-    if include_done:
-        params["includeDone"] = True
+        params["s"] = query
+    if not include_done:
+        params["filter"] = "done = false"
 
     tasks: list = _get("/tasks", params)
 
@@ -286,11 +302,10 @@ def add(
         None, "--project", "-p", help="Project name (substring match)"
     ),
     tag: Optional[List[str]] = typer.Option(
-        None, "--tag", "-t", help="Tag name (repeat for multiple: -t foo -t bar)"
+        None, "--tag", "-t", help="Label name (repeat for multiple: -t foo -t bar)"
     ),
-    notes: Optional[str] = typer.Option(None, "--notes", "-n", help="Task notes"),
+    notes: Optional[str] = typer.Option(None, "--notes", "-n", help="Task description"),
     due: Optional[str] = typer.Option(None, "--due", "-d", help="Due date (today, tomorrow, or YYYY-MM-DD)"),
-    estimate: Optional[str] = typer.Option(None, "--estimate", "-e", help="Time estimate (e.g. 1h30m, 90m, 2h)"),
 ):
     """Create a new task.
 
@@ -300,48 +315,44 @@ def add(
     is_tty = sys.stdin.isatty()
     all_projects: list = _get("/projects")
 
-    project_id: Optional[str] = None
     if project:
         project_id = _match_project(project, all_projects)
     elif is_tty:
         project_id = _pick_project(all_projects)
+    else:
+        project_id = _default_project_id(all_projects)
 
     body: dict = {"title": title}
-    if project_id:
-        body["projectId"] = project_id
     if notes:
-        body["notes"] = notes
+        body["description"] = notes
     if due:
-        body["dueDay"] = _parse_due(due)
-    if estimate:
-        body["timeEstimate"] = _parse_duration(estimate)
+        body["due_date"] = _due_day_to_iso(_parse_due(due))
 
-    tag_ids: List[str] = []
+    result: dict = _put(f"/projects/{project_id}/tasks", body)
+
     if tag:
-        all_tags: list = _get("/tags")
+        all_labels: list = _get("/labels")
         for t in tag:
-            hits = [x for x in all_tags if t.lower() in x["title"].lower()]
+            hits = [x for x in all_labels if t.lower() in x["title"].lower()]
             if not hits:
-                console.print(f"[yellow]Warning:[/yellow] no tag matching '{t}' — skipped.")
+                console.print(f"[yellow]Warning:[/yellow] no label matching '{t}' — skipped.")
             elif len(hits) == 1:
-                tag_ids.append(hits[0]["id"])
+                _put(f"/tasks/{result['id']}/labels", {"label_id": hits[0]["id"]})
             elif is_tty:
                 chosen = questionary.select(
-                    f"Multiple tags match '{t}', pick one:",
+                    f"Multiple labels match '{t}', pick one:",
                     choices=[x["title"] for x in hits],
                 ).ask()
                 if chosen is None:
                     raise typer.Exit(0)
-                tag_ids.append(next(x["id"] for x in hits if x["title"] == chosen))
+                label_id = next(x["id"] for x in hits if x["title"] == chosen)
+                _put(f"/tasks/{result['id']}/labels", {"label_id": label_id})
             else:
-                console.print(f"[yellow]Warning:[/yellow] multiple tags match '{t}' — skipped.")
+                console.print(f"[yellow]Warning:[/yellow] multiple labels match '{t}' — skipped.")
 
-    if tag_ids:
-        body["tagIds"] = tag_ids
-
-    result: dict = _post("/tasks", body)
+    project_title = next((p["title"] for p in all_projects if p["id"] == project_id), "?")
     console.print(
-        f"[green]✓[/green] Created: [bold]{result['title']}[/bold]  ({_project_rich_name(result, all_projects)})"
+        f"[green]✓[/green] Created: [bold]{result['title']}[/bold]  ({project_title})"
     )
 
 
@@ -349,32 +360,29 @@ def add(
 def edit(
     query: Optional[str] = typer.Argument(None, help="Part of the task title to search for"),
     title: Optional[str] = typer.Option(None, "--title", help="New title"),
-    notes: Optional[str] = typer.Option(None, "--notes", "-n", help="New notes"),
+    notes: Optional[str] = typer.Option(None, "--notes", "-n", help="New description"),
     due: Optional[str] = typer.Option(None, "--due", "-d", help="Due date (today, tomorrow, or YYYY-MM-DD)"),
-    estimate: Optional[str] = typer.Option(None, "--estimate", "-e", help="Time estimate (e.g. 1h30m, 90m, 2h)"),
     project: Optional[str] = typer.Option(None, "--project", "-p", help="Move to project (name substring)"),
 ):
     """Edit an existing task."""
     task = _resolve_task(query)
 
-    body: dict = {}
+    changes: dict = {}
     if title:
-        body["title"] = title
+        changes["title"] = title
     if notes:
-        body["notes"] = notes
+        changes["description"] = notes
     if due:
-        body["dueDay"] = _parse_due(due)
-    if estimate:
-        body["timeEstimate"] = _parse_duration(estimate)
+        changes["due_date"] = _due_day_to_iso(_parse_due(due))
     if project:
         all_projects: list = _get("/projects")
-        body["projectId"] = _match_project(project, all_projects)
+        changes["project_id"] = _match_project(project, all_projects)
 
-    if not body:
-        console.print("[yellow]Nothing to update. Use --title, --notes, --due, --estimate, or --project.[/yellow]")
+    if not changes:
+        console.print("[yellow]Nothing to update. Use --title, --notes, --due, or --project.[/yellow]")
         raise typer.Exit(0)
 
-    _patch(f"/tasks/{task['id']}", body)
+    _task_update(task["id"], changes)
     console.print(f"[green]✓[/green] Updated: [bold]{task['title']}[/bold]")
 
 
@@ -389,7 +397,7 @@ def done(
     Omit QUERY to pick interactively from all active tasks.
     """
     task = _resolve_task(query)
-    _patch(f"/tasks/{task['id']}", {"isDone": True})
+    _task_update(task["id"], {"done": True})
     console.print(f"[green]✓[/green] Done: [bold]{task['title']}[/bold]")
 
 
@@ -405,49 +413,31 @@ def list_tasks(
         False, "--done", help="Include completed tasks"
     ),
     query: Optional[str] = typer.Option(None, "--query", "-q", help="Filter by title"),
-    archived: bool = typer.Option(False, "--archived", "-a", help="Show archived tasks instead of active"),
 ):
     """List tasks."""
     all_projects: list = _get("/projects")
 
     params: dict = {}
     if query:
-        params["query"] = query
-    if archived:
-        params["source"] = "archived"
-        params["includeDone"] = True
-    elif done_flag:
-        params["includeDone"] = True
+        params["s"] = query
+    filter_parts: List[str] = []
+    if not done_flag:
+        filter_parts.append("done = false")
     if project:
-        params["projectId"] = _match_project(project, all_projects)
+        filter_parts.append(f"project_id = {_match_project(project, all_projects)}")
+    if filter_parts:
+        params["filter"] = " && ".join(filter_parts)
 
     tasks: list = _get("/tasks", params)
-    all_tags: list = _get("/tags")
 
     if due:
         due_day = _parse_due(due)
-        if archived:
-            tasks = [
-                t for t in tasks
-                if t.get("doneOn")
-                and datetime.fromtimestamp(t["doneOn"] / 1000).strftime("%Y-%m-%d") == due_day
-            ]
-        else:
-            tasks = [
-                t for t in tasks
-                if t.get("dueDay") == due_day
-                or (
-                    t.get("dueWithTime")
-                    and datetime.fromtimestamp(t["dueWithTime"] / 1000).strftime("%Y-%m-%d") == due_day
-                )
-            ]
-    tasks.sort(key=lambda t: (
-        t["dueWithTime"]
-        if t.get("dueWithTime")
-        else datetime.strptime(t["dueDay"], "%Y-%m-%d").timestamp() * 1000
-        if t.get("dueDay")
-        else float("inf")
-    ))
+        tasks = [t for t in tasks if _format_due(t)[:10] == due_day]
+
+    def _sort_key(t: dict):
+        dt = _parse_vikunja_ts(t.get("due_date", ""))
+        return dt.timestamp() if dt else float("inf")
+    tasks.sort(key=_sort_key)
 
     if not tasks:
         console.print("[yellow]No tasks found.[/yellow]")
@@ -456,27 +446,23 @@ def list_tasks(
     # Precompute the fixed-content columns so the Title column can be sized
     # against whatever space they actually need, and pre-wrapped to match.
     project_cells = [_project_rich_name(t, all_projects) for t in tasks]
-    tags_cells = [_tags_rich_text(t, all_tags) for t in tasks]
-    est_cells = [_fmt_duration(t.get("timeEstimate", 0)) for t in tasks]
-    spent_cells = [_fmt_duration(t.get("timeSpent", 0)) for t in tasks]
+    labels_cells = [_labels_rich_text(t) for t in tasks]
     due_cells = [_format_due(t) for t in tasks]
-    recurring_cells = ["[blue]↻[/blue]" if t.get("repeatCfgId") else "" for t in tasks]
-    done_cells = ["[green]✓[/green]" if t.get("isDone") else "" for t in tasks]
+    recurring_cells = ["[blue]↻[/blue]" if t.get("repeat_after") else "" for t in tasks]
+    done_cells = ["[green]✓[/green]" if t.get("done") else "" for t in tasks]
 
     def _col_w(header: str, cells: List[str]) -> int:
         return max([len(header)] + [Text.from_markup(c).cell_len for c in cells])
 
     w_project = _col_w("Project", project_cells)
-    w_tags = _col_w("Tags", tags_cells)
-    w_est = _col_w("Est.", est_cells)
-    w_spent = _col_w("Spent", spent_cells)
+    w_labels = _col_w("Labels", labels_cells)
     w_due = _col_w("Due", due_cells)
     w_recurring = 1
     w_done = 1
 
-    num_columns = 8
+    num_columns = 6
     overhead = 3 * num_columns + 1  # empirical: per-column padding + table margins
-    other_width = w_project + w_tags + w_est + w_spent + w_due + w_recurring + w_done
+    other_width = w_project + w_labels + w_due + w_recurring + w_done
     # Below MIN_TABLE_WIDTH there isn't enough room to lay out all columns
     # sensibly; render at MIN_TABLE_WIDTH instead and let the terminal soft-wrap.
     render_width = max(console.size.width, MIN_TABLE_WIDTH)
@@ -486,9 +472,7 @@ def list_tasks(
     table = Table(box=box.SIMPLE, show_header=True, header_style="bold")
     table.add_column("Title", width=title_width)
     table.add_column("Project", width=w_project)
-    table.add_column("Tags", width=w_tags)
-    table.add_column("Est.", style="cyan", width=w_est, no_wrap=True)
-    table.add_column("Spent", style="magenta", width=w_spent, no_wrap=True)
+    table.add_column("Labels", width=w_labels)
     table.add_column("Due", style="yellow", width=w_due, no_wrap=True)
     table.add_column("", width=w_recurring, justify="center", no_wrap=True)
     table.add_column("", width=w_done, justify="center")
@@ -497,13 +481,11 @@ def list_tasks(
         table.add_row(
             _wrap_title(t["title"], title_width),
             project_cells[i],
-            tags_cells[i],
-            est_cells[i],
-            spent_cells[i],
+            labels_cells[i],
             due_cells[i],
             recurring_cells[i],
             done_cells[i],
-            style="dim" if t.get("isDone") else "",
+            style="dim" if t.get("done") else "",
         )
 
     render_console.print(table)
@@ -544,50 +526,6 @@ def delete(
     console.print(f"[red]✗[/red] Deleted: [bold]{task['title']}[/bold]")
 
 
-@app.command(name="clear-archived")
-def clear_archived(
-    yes: bool = typer.Option(False, "--yes", "-y", help="Skip confirmation prompt"),
-):
-    """Permanently delete every archived task.
-
-    The REST API has no endpoint to delete archived tasks directly, so each
-    task is restored to active and then deleted immediately after.
-    """
-    tasks: list = _get("/tasks", {"source": "archived", "includeDone": True})
-    if not tasks:
-        console.print("[yellow]No archived tasks found.[/yellow]")
-        return
-
-    if not yes:
-        answer = questionary.confirm(
-            f"Permanently delete all {len(tasks)} archived task(s)? This cannot be undone.",
-            default=False,
-        ).ask()
-        if answer is None or not answer:
-            console.print("[dim]Cancelled.[/dim]")
-            raise typer.Exit(0)
-
-    failures: List[str] = []
-    deleted = 0
-    for t in track(tasks, description="Deleting archived tasks..."):
-        try:
-            r = requests.post(f"{BASE_URL}/tasks/{t['id']}/restore", json={}, timeout=10)
-            if not r.json().get("ok"):
-                raise RuntimeError(r.json().get("error", {}).get("message", "restore failed"))
-            r = requests.delete(f"{BASE_URL}/tasks/{t['id']}", timeout=10)
-            if not r.json().get("ok"):
-                raise RuntimeError(r.json().get("error", {}).get("message", "delete failed"))
-            deleted += 1
-        except (requests.RequestException, RuntimeError) as e:
-            failures.append(f"{t['title']}: {e}")
-
-    console.print(f"[red]✗[/red] Deleted {deleted} archived task(s).")
-    if failures:
-        console.print(f"[yellow]{len(failures)} task(s) could not be deleted:[/yellow]")
-        for f in failures:
-            console.print(f"  [dim]{f}[/dim]")
-
-
 @app.command()
 def punt(
     query: Optional[str] = typer.Argument(
@@ -597,18 +535,19 @@ def punt(
     """Push a task's due date to the next day."""
     task = _resolve_task(query)
 
-    if task.get("dueWithTime"):
-        new_ts = task["dueWithTime"] + 86_400_000
-        _patch(f"/tasks/{task['id']}", {"dueWithTime": new_ts})
-        label = datetime.fromtimestamp(new_ts / 1000).strftime("%Y-%m-%d %H:%M")
-    elif task.get("dueDay"):
-        current = datetime.strptime(task["dueDay"], "%Y-%m-%d").date()
-        label = (current + timedelta(days=1)).strftime("%Y-%m-%d")
-        _patch(f"/tasks/{task['id']}", {"dueDay": label})
+    dt = _parse_vikunja_ts(task.get("due_date", ""))
+    if dt is None:
+        new_dt = datetime.combine(date.today() + timedelta(days=1), datetime.min.time(), tzinfo=timezone.utc)
     else:
-        label = (date.today() + timedelta(days=1)).strftime("%Y-%m-%d")
-        _patch(f"/tasks/{task['id']}", {"dueDay": label})
+        new_dt = dt + timedelta(days=1)
 
+    new_iso = new_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+    _task_update(task["id"], {"due_date": new_iso})
+
+    if (new_dt.hour, new_dt.minute, new_dt.second) == (0, 0, 0):
+        label = new_dt.strftime("%Y-%m-%d")
+    else:
+        label = new_dt.astimezone().strftime("%Y-%m-%d %H:%M")
     console.print(f"[green]✓[/green] Punted: [bold]{task['title']}[/bold]  → {label}")
 
 
