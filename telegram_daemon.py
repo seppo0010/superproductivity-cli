@@ -183,13 +183,15 @@ def _day_to_due_iso(day: date) -> str:
 
 def _task_due_dt(task: dict) -> Optional[datetime]:
     """The due datetime for tasks with an explicit time-of-day. Never
-    considered "overdue" (or shown with a time) for either of the two
-    "no specific time" conventions in use: the literal-UTC-midnight sentinel
-    from migrated data, and 23:59 local time — used for tasks created
-    directly in Vikunja, which has no native date-only due date, as a
-    "due sometime today" marker."""
+    considered "overdue" (or shown with a time) for 23:59 local time — the
+    sole "no specific time" convention (used for tasks with no native
+    date-only due date, as a "due sometime today" marker). A literal-UTC-
+    midnight sentinel used to be treated the same way for migrated data, but
+    that collided with any genuine local due time that happens to convert to
+    UTC midnight (e.g. 21:00 local for UTC-3), silently swallowing real
+    reminders — retired in favor of this single convention."""
     dt = _parse_vikunja_ts(task.get("due_date", ""))
-    if dt is None or (dt.hour, dt.minute, dt.second) == (0, 0, 0):
+    if dt is None:
         return None
     local = dt.astimezone()
     if (local.hour, local.minute) == (23, 59):
@@ -201,8 +203,6 @@ def _task_local_date(task: dict) -> Optional[date]:
     dt = _parse_vikunja_ts(task.get("due_date", ""))
     if dt is None:
         return None
-    if (dt.hour, dt.minute, dt.second) == (0, 0, 0):
-        return dt.date()
     return dt.astimezone().date()
 
 
@@ -218,13 +218,20 @@ def _next_9am(now: datetime) -> datetime:
     return datetime.combine(target_date, dtime(9, 0))
 
 
-def _today_tasks() -> list:
-    """Active tasks due today, sorted by time (day-only tasks first)."""
+def _tasks_for_date(day: date) -> list:
+    """Active tasks due on `day`, sorted by time (day-only tasks first)."""
     tasks: list = _vk_get("/tasks", {"filter": "done = false"})
-    today = date.today()
-    result = [t for t in tasks if _task_local_date(t) == today]
+    result = [t for t in tasks if _task_local_date(t) == day]
     result.sort(key=lambda t: (_task_due_dt(t) or datetime.min.replace(tzinfo=timezone.utc)))
     return result
+
+
+def _today_tasks() -> list:
+    return _tasks_for_date(date.today())
+
+
+def _tomorrow_tasks() -> list:
+    return _tasks_for_date(date.today() + timedelta(days=1))
 
 
 _INBOX_LABEL = "📥 Inbox"
@@ -255,9 +262,9 @@ def _project_title_map() -> dict:
     return {p["id"]: _project_display(p) for p in _real_projects()}
 
 
-def _format_today_message(tasks: list) -> str:
+def _format_day_message(tasks: list, label: str) -> str:
     if not tasks:
-        return "🎉 No hay tareas para hoy."
+        return f"🎉 No hay tareas para {label}."
 
     project_map = _project_title_map()
     groups: dict[str, list] = {}
@@ -265,7 +272,7 @@ def _format_today_message(tasks: list) -> str:
         project_title = project_map.get(t.get("project_id"), _INBOX_LABEL)
         groups.setdefault(project_title, []).append(t)
 
-    lines = [f"📋 <b>Tareas de hoy</b> ({len(tasks)})"]
+    lines = [f"📋 <b>Tareas de {label}</b> ({len(tasks)})"]
     for project_title in sorted(groups, key=lambda p: (p == _INBOX_LABEL, p)):
         lines.append("")
         lines.append(f"<b>{html.escape(project_title)}</b>")
@@ -474,7 +481,7 @@ def check_daily_digest() -> None:
 
     try:
         _telegram_call(
-            "sendMessage", chat_id=CHAT_ID, text=_format_today_message(tasks), parse_mode="HTML"
+            "sendMessage", chat_id=CHAT_ID, text=_format_day_message(tasks, "hoy"), parse_mode="HTML"
         )
     except (requests.RequestException, RuntimeError) as e:
         log.error("Failed to send daily digest: %s", e)
@@ -768,9 +775,23 @@ def _handle_message(message: dict) -> None:
             return
 
         _telegram_call(
-            "sendMessage", chat_id=chat_id, text=_format_today_message(tasks), parse_mode="HTML"
+            "sendMessage", chat_id=chat_id, text=_format_day_message(tasks, "hoy"), parse_mode="HTML"
         )
         log.info("Sent today's task list (%d task(s)) to chat %s", len(tasks), chat_id)
+        return
+
+    if command in ("/mañana", "/tomorrow"):
+        try:
+            tasks = _tomorrow_tasks()
+        except requests.RequestException as e:
+            log.error("Could not fetch tomorrow's tasks: %s", e)
+            _telegram_call("sendMessage", chat_id=chat_id, text=f"Error: {e}")
+            return
+
+        _telegram_call(
+            "sendMessage", chat_id=chat_id, text=_format_day_message(tasks, "mañana"), parse_mode="HTML"
+        )
+        log.info("Sent tomorrow's task list (%d task(s)) to chat %s", len(tasks), chat_id)
         return
 
     if command == "/hecho":
@@ -863,6 +884,7 @@ def main() -> None:
             "setMyCommands",
             commands=[
                 {"command": "hoy", "description": "Tareas de hoy"},
+                {"command": "tomorrow", "description": "Tareas de mañana"},
                 {"command": "hecho", "description": "Marcar una tarea de hoy como hecha"},
                 {"command": "borrar", "description": "Borrar una tarea de hoy"},
             ],
