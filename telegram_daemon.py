@@ -51,7 +51,7 @@ WEBHOOK_HOST = os.environ.get("VIKUNJA_WEBHOOK_HOST", "0.0.0.0")
 WEBHOOK_PORT = int(os.environ.get("VIKUNJA_WEBHOOK_PORT", "8765"))
 
 TELEGRAM_API = "https://api.telegram.org/bot{token}/{method}"
-CHECK_INTERVAL_SECONDS = 1800  # safety-net reconciliation cadence
+CHECK_INTERVAL_SECONDS = 300  # safety-net reconciliation cadence
 
 STATE_DIR = Path(os.environ.get("SP_CLI_STATE_DIR", Path.home() / ".config" / "sp-cli"))
 NOTIFY_STATE_FILE = STATE_DIR / "notify_state.json"
@@ -59,7 +59,7 @@ BOT_STATE_FILE = STATE_DIR / "telegram_bot_state.json"
 DAILY_DIGEST_STATE_FILE = STATE_DIR / "daily_digest_state.json"
 PENDING_TASK_STATE_FILE = STATE_DIR / "pending_task_state.json"
 UNDO_STATE_FILE = STATE_DIR / "undo_state.json"
-DAILY_DIGEST_HOUR = 7
+DAILY_DIGEST_HOUR = 6
 
 TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
@@ -267,19 +267,12 @@ def _format_day_message(tasks: list, label: str) -> str:
         return f"🎉 No hay tareas para {label}."
 
     project_map = _project_title_map()
-    groups: dict[str, list] = {}
+    lines = [f"📋 <b>Tareas de {label}</b> ({len(tasks)})", ""]
     for t in tasks:
+        due_dt = _task_due_dt(t)
+        time_str = due_dt.astimezone().strftime("%H:%M") if due_dt else "──"
         project_title = project_map.get(t.get("project_id"), _INBOX_LABEL)
-        groups.setdefault(project_title, []).append(t)
-
-    lines = [f"📋 <b>Tareas de {label}</b> ({len(tasks)})"]
-    for project_title in sorted(groups, key=lambda p: (p == _INBOX_LABEL, p)):
-        lines.append("")
-        lines.append(f"<b>{html.escape(project_title)}</b>")
-        for t in groups[project_title]:
-            due_dt = _task_due_dt(t)
-            time_str = due_dt.astimezone().strftime("%H:%M") if due_dt else "──"
-            lines.append(f"🕐 {time_str}  {html.escape(t['title'])}")
+        lines.append(f"🕐 {time_str}  {html.escape(t['title'])} · {html.escape(project_title)}")
     return "\n".join(lines)
 
 
