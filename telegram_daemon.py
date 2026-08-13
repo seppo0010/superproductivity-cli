@@ -313,6 +313,7 @@ def _send_due_notification(task: dict) -> bool:
                 {"text": "+1 hora", "callback_data": f"snooze60:{task['id']}"},
                 {"text": "🌅 9am", "callback_data": f"snooze9am:{task['id']}"},
             ],
+            [{"text": "🌆 Más tarde (hoy, sin hora)", "callback_data": f"snoozeday:{task['id']}"}],
         ]
     }
     text = f"⏰ Vencida: {task['title']}\n{_format_due(task)}"
@@ -721,6 +722,9 @@ def _handle_callback(callback: dict) -> None:
             new_dt = target.astimezone(timezone.utc)
             _vk_task_update(task_id, {"due_date": new_dt.strftime("%Y-%m-%dT%H:%M:%SZ")})
             result_text = f"⏰ {task['title']} — pospuesta a {target.strftime('%Y-%m-%d %H:%M')}"
+        elif action == "snoozeday":
+            _vk_task_update(task_id, {"due_date": _day_to_due_iso(date.today())})
+            result_text = f"⏰ {task['title']} — pospuesta a hoy, sin hora fija"
         else:
             log.warning("Unknown action: %s", action)
             _telegram_call("answerCallbackQuery", callback_query_id=callback_id)
