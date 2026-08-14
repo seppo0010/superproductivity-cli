@@ -234,6 +234,18 @@ def _tomorrow_tasks() -> list:
     return _tasks_for_date(date.today() + timedelta(days=1))
 
 
+def _overdue_tasks() -> list:
+    """Active tasks whose due date's local calendar day is before today.
+    Distinct from check_due_tasks's notion of overdue (which fires the
+    instant a due *time* passes): date-only tasks (23:59 "sin hora"
+    convention) only show up here once their whole day has elapsed."""
+    tasks: list = _vk_get("/tasks", {"filter": "done = false"})
+    today = date.today()
+    result = [t for t in tasks if (d := _task_local_date(t)) is not None and d < today]
+    result.sort(key=lambda t: _task_local_date(t))
+    return result
+
+
 _INBOX_LABEL = "📥 Inbox"
 
 
@@ -262,17 +274,35 @@ def _project_title_map() -> dict:
     return {p["id"]: _project_display(p) for p in _real_projects()}
 
 
-def _format_day_message(tasks: list, label: str) -> str:
-    if not tasks:
+def _format_day_message(tasks: list, label: str, overdue: Optional[list] = None) -> str:
+    overdue = overdue or []
+    if not tasks and not overdue:
         return f"🎉 No hay tareas para {label}."
 
     project_map = _project_title_map()
-    lines = [f"📋 <b>Tareas de {label}</b> ({len(tasks)})", ""]
-    for t in tasks:
-        due_dt = _task_due_dt(t)
-        time_str = due_dt.astimezone().strftime("%H:%M") if due_dt else "──"
-        project_title = project_map.get(t.get("project_id"), _INBOX_LABEL)
-        lines.append(f"🕐 {time_str}  {html.escape(t['title'])} · {html.escape(project_title)}")
+    lines = []
+
+    if overdue:
+        lines.append(f"⚠️ <b>Tareas vencidas</b> ({len(overdue)})")
+        lines.append("")
+        for t in overdue:
+            due_date = _task_local_date(t)
+            date_str = due_date.strftime("%Y-%m-%d") if due_date else "──"
+            project_title = project_map.get(t.get("project_id"), _INBOX_LABEL)
+            lines.append(f"⚠️ {date_str}  {html.escape(t['title'])} · {html.escape(project_title)}")
+        lines.append("")
+
+    if tasks:
+        lines.append(f"📋 <b>Tareas de {label}</b> ({len(tasks)})")
+        lines.append("")
+        for t in tasks:
+            due_dt = _task_due_dt(t)
+            time_str = due_dt.astimezone().strftime("%H:%M") if due_dt else "──"
+            project_title = project_map.get(t.get("project_id"), _INBOX_LABEL)
+            lines.append(f"🕐 {time_str}  {html.escape(t['title'])} · {html.escape(project_title)}")
+    elif overdue:
+        lines.append(f"🎉 No hay tareas para {label} (aparte de las vencidas).")
+
     return "\n".join(lines)
 
 
@@ -766,15 +796,20 @@ def _handle_message(message: dict) -> None:
     if command in ("/hoy", "/today"):
         try:
             tasks = _today_tasks()
+            overdue = _overdue_tasks()
         except requests.RequestException as e:
             log.error("Could not fetch today's tasks: %s", e)
             _telegram_call("sendMessage", chat_id=chat_id, text=f"Error: {e}")
             return
 
         _telegram_call(
-            "sendMessage", chat_id=chat_id, text=_format_day_message(tasks, "hoy"), parse_mode="HTML"
+            "sendMessage", chat_id=chat_id, text=_format_day_message(tasks, "hoy", overdue=overdue),
+            parse_mode="HTML",
         )
-        log.info("Sent today's task list (%d task(s)) to chat %s", len(tasks), chat_id)
+        log.info(
+            "Sent today's task list (%d task(s), %d overdue) to chat %s",
+            len(tasks), len(overdue), chat_id,
+        )
         return
 
     if command in ("/mañana", "/tomorrow"):
