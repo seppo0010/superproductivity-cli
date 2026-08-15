@@ -37,7 +37,7 @@ import re
 import sys
 import threading
 import time
-from datetime import date, datetime, timedelta, timezone, time as dtime
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
 
@@ -58,6 +58,7 @@ NOTIFY_STATE_FILE = STATE_DIR / "notify_state.json"
 BOT_STATE_FILE = STATE_DIR / "telegram_bot_state.json"
 DAILY_DIGEST_STATE_FILE = STATE_DIR / "daily_digest_state.json"
 PENDING_TASK_STATE_FILE = STATE_DIR / "pending_task_state.json"
+PENDING_TIME_STATE_FILE = STATE_DIR / "pending_time_state.json"
 UNDO_STATE_FILE = STATE_DIR / "undo_state.json"
 DAILY_DIGEST_HOUR = 6
 
@@ -213,9 +214,13 @@ def _format_due(task: dict) -> str:
     return dt.astimezone().strftime("%Y-%m-%d %H:%M")
 
 
-def _next_9am(now: datetime) -> datetime:
-    target_date = now.date() if now.hour < 9 else now.date() + timedelta(days=1)
-    return datetime.combine(target_date, dtime(9, 0))
+def _next_occurrence_iso(hour: int, minute: int) -> str:
+    """UTC ISO timestamp for the next local wall-clock HH:MM — today if that
+    time hasn't passed yet, tomorrow otherwise."""
+    now_local = datetime.now()
+    candidate = now_local.replace(hour=hour, minute=minute, second=0, microsecond=0)
+    target_date = candidate.date() if candidate > now_local else candidate.date() + timedelta(days=1)
+    return _local_time_to_iso(target_date, hour, minute)
 
 
 def _tasks_for_date(day: date) -> list:
@@ -313,12 +318,43 @@ def _hecho_button_label(task: dict, project_map: dict) -> str:
     return f"{time_str} · {project_title} · {task['title']}"
 
 
-def _task_picker_keyboard(tasks: list, action: str) -> dict:
+def _task_picker_keyboard(tasks: list, action: str, label_fn=_hecho_button_label) -> dict:
     project_map = _project_title_map()
     return {
         "inline_keyboard": [
-            [{"text": _hecho_button_label(t, project_map), "callback_data": f"{action}:{t['id']}"}] for t in tasks
+            [{"text": label_fn(t, project_map), "callback_data": f"{action}:{t['id']}"}] for t in tasks
         ] + [[{"text": "❌ Cancelar", "callback_data": "hcancel:0"}]]
+    }
+
+
+def _punt_button_label(task: dict, project_map: dict, today: date) -> str:
+    """Like _hecho_button_label, but overdue tasks show their (past) due
+    date instead of a time, since "──" for every overdue row would make
+    them indistinguishable from each other in the picker."""
+    task_date = _task_local_date(task)
+    if task_date is not None and task_date < today:
+        prefix = task_date.strftime("%Y-%m-%d")
+    else:
+        due_dt = _task_due_dt(task)
+        prefix = due_dt.astimezone().strftime("%H:%M") if due_dt else "──"
+    project_title = project_map.get(task.get("project_id"), _INBOX_LABEL)
+    return f"{prefix} · {project_title} · {task['title']}"
+
+
+def _punt_due_keyboard(task_id: int) -> dict:
+    return {
+        "inline_keyboard": [
+            [
+                {"text": "+10 min", "callback_data": f"puntdue:{task_id}:snooze10"},
+                {"text": "+1 hora", "callback_data": f"puntdue:{task_id}:snooze60"},
+            ],
+            [
+                {"text": "+24 horas", "callback_data": f"puntdue:{task_id}:snooze1440"},
+                {"text": "🌆 Hoy, sin hora", "callback_data": f"puntdue:{task_id}:today"},
+            ],
+            [{"text": "⏰ Elegir hora", "callback_data": f"puntdue:{task_id}:pick"}],
+            [{"text": "❌ Cancelar", "callback_data": "hcancel:0"}],
+        ]
     }
 
 
@@ -341,7 +377,7 @@ def _send_due_notification(task: dict) -> bool:
             [
                 {"text": "+10 min", "callback_data": f"snooze10:{task['id']}"},
                 {"text": "+1 hora", "callback_data": f"snooze60:{task['id']}"},
-                {"text": "🌅 9am", "callback_data": f"snooze9am:{task['id']}"},
+                {"text": "+24 horas", "callback_data": f"snooze1440:{task['id']}"},
             ],
             [{"text": "🌆 Más tarde (hoy, sin hora)", "callback_data": f"snoozeday:{task['id']}"}],
         ]
@@ -523,7 +559,7 @@ _DUE_DATE_KEYBOARD = {
             {"text": "Hoy", "callback_data": "ntdue:today"},
             {"text": "Mañana", "callback_data": "ntdue:tomorrow"},
         ],
-        [{"text": "Sin fecha", "callback_data": "ntdue:none"}],
+        [{"text": "⏰ Elegir hora", "callback_data": "ntdue:pick"}],
     ]
 }
 
@@ -595,8 +631,7 @@ def _handle_new_task_project(callback_id: str, chat_id, message_id, payload: str
 
 def _handle_new_task_due(callback_id: str, chat_id, message_id, payload: str) -> None:
     state = _load_json(PENDING_TASK_STATE_FILE, {})
-    pending = state.pop(str(chat_id), None)
-    _save_json(PENDING_TASK_STATE_FILE, state)
+    pending = state.get(str(chat_id))
 
     if not pending or "project_title" not in pending:
         _telegram_call(
@@ -605,21 +640,34 @@ def _handle_new_task_due(callback_id: str, chat_id, message_id, payload: str) ->
         )
         return
 
-    due_date_iso = None
-    due_label = "Sin fecha"
-    if payload == "today":
-        due_date_iso = _day_to_due_iso(date.today())
-        due_label = "Hoy"
-    elif payload == "tomorrow":
-        due_date_iso = _local_time_to_iso(date.today() + timedelta(days=1), 9, 0)
-        due_label = "Mañana"
+    state.pop(str(chat_id), None)
+    _save_json(PENDING_TASK_STATE_FILE, state)
 
-    body: dict = {"title": pending["title"]}
-    if due_date_iso:
-        body["due_date"] = due_date_iso
+    if payload == "pick":
+        time_state = _load_json(PENDING_TIME_STATE_FILE, {})
+        time_state[str(chat_id)] = {
+            "kind": "newtask", "title": pending["title"],
+            "project_id": pending["project_id"], "project_title": pending["project_title"],
+        }
+        _save_json(PENDING_TIME_STATE_FILE, time_state)
+        _telegram_call(
+            "editMessageText", chat_id=chat_id, message_id=message_id,
+            text=f"📝 {pending['title']}\nProyecto: {pending['project_title']}\n¿A qué hora? (HH:MM)",
+        )
+        _telegram_call("answerCallbackQuery", callback_query_id=callback_id)
+        return
+
+    if payload == "today":
+        due_date_iso, due_label = _day_to_due_iso(date.today()), "Hoy"
+    elif payload == "tomorrow":
+        due_date_iso, due_label = _day_to_due_iso(date.today() + timedelta(days=1)), "Mañana"
+    else:
+        log.warning("Unknown ntdue payload: %s", payload)
+        _telegram_call("answerCallbackQuery", callback_query_id=callback_id)
+        return
 
     try:
-        _vk_put(f"/projects/{pending['project_id']}/tasks", body)
+        _vk_put(f"/projects/{pending['project_id']}/tasks", {"title": pending["title"], "due_date": due_date_iso})
     except requests.RequestException as e:
         log.error("Could not create task: %s", e)
         _telegram_call("editMessageText", chat_id=chat_id, message_id=message_id, text=f"Error: {e}")
@@ -634,6 +682,200 @@ def _handle_new_task_due(callback_id: str, chat_id, message_id, payload: str) ->
     )
     _telegram_call("answerCallbackQuery", callback_query_id=callback_id, text="Creada")
     log.info("Created task '%s' for chat %s", pending["title"], chat_id)
+
+
+# ─── Punt flow (postpone an existing task, two-step callback) ──────────────
+
+def _handle_punt_pick(callback_id: str, chat_id, message_id, payload: str) -> None:
+    try:
+        task_id = int(payload)
+    except ValueError:
+        _telegram_call(
+            "answerCallbackQuery", callback_query_id=callback_id,
+            text="Opción inválida", show_alert=True,
+        )
+        return
+
+    try:
+        task = _find_task(task_id)
+    except requests.RequestException as e:
+        log.error("Could not fetch task %s: %s", task_id, e)
+        _telegram_call(
+            "answerCallbackQuery", callback_query_id=callback_id,
+            text=f"Error: {e}", show_alert=True,
+        )
+        return
+
+    if task is None:
+        log.warning("Task %s no longer exists", task_id)
+        _telegram_call(
+            "answerCallbackQuery", callback_query_id=callback_id,
+            text="Esa tarea ya no existe", show_alert=True,
+        )
+        return
+
+    _telegram_call(
+        "editMessageText", chat_id=chat_id, message_id=message_id,
+        text=f"📅 {task['title']}\n¿Nuevo vencimiento?", reply_markup=_punt_due_keyboard(task_id),
+    )
+    _telegram_call("answerCallbackQuery", callback_query_id=callback_id)
+
+
+def _apply_punt(task: dict, task_id: int, due_date_iso: str, due_label: str) -> str:
+    """Applies a new due date to `task` (fetched pre-change, for the undo
+    snapshot) and returns the confirmation text. Raises RequestException."""
+    _vk_task_update(task_id, {"due_date": due_date_iso})
+    with _state_lock:
+        state = _load_json(UNDO_STATE_FILE, {})
+        state[str(task_id)] = {"action": "punt", "task": task}
+        _save_json(UNDO_STATE_FILE, state)
+    log.info("Punted task %s to %s", task_id, due_label)
+    return f"📅 {task['title']} — pospuesta a {due_label}"
+
+
+def _handle_punt_due(callback_id: str, chat_id, message_id, payload: str) -> None:
+    try:
+        task_id_str, option = payload.split(":", 1)
+        task_id = int(task_id_str)
+    except ValueError:
+        log.warning("Malformed puntdue payload: %s", payload)
+        _telegram_call("answerCallbackQuery", callback_query_id=callback_id)
+        return
+
+    try:
+        task = _find_task(task_id)
+    except requests.RequestException as e:
+        log.error("Could not fetch task %s: %s", task_id, e)
+        _telegram_call(
+            "answerCallbackQuery", callback_query_id=callback_id,
+            text=f"Error: {e}", show_alert=True,
+        )
+        return
+
+    if task is None:
+        log.warning("Task %s no longer exists", task_id)
+        _telegram_call(
+            "answerCallbackQuery", callback_query_id=callback_id,
+            text="Esa tarea ya no existe", show_alert=True,
+        )
+        return
+
+    if option == "pick":
+        with _state_lock:
+            time_state = _load_json(PENDING_TIME_STATE_FILE, {})
+            time_state[str(chat_id)] = {"kind": "punt", "task_id": task_id, "task_title": task["title"]}
+            _save_json(PENDING_TIME_STATE_FILE, time_state)
+        _telegram_call(
+            "editMessageText", chat_id=chat_id, message_id=message_id,
+            text=f"📅 {task['title']}\n¿A qué hora? (HH:MM)",
+        )
+        _telegram_call("answerCallbackQuery", callback_query_id=callback_id)
+        return
+
+    if option == "snooze10":
+        due_date_iso = (datetime.now(timezone.utc) + timedelta(minutes=10)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        due_label = "en 10 minutos"
+    elif option == "snooze60":
+        due_date_iso = (datetime.now(timezone.utc) + timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        due_label = "en 1 hora"
+    elif option == "snooze1440":
+        # Adds a day to the task's own due date (preserving its time-of-day,
+        # including the 23:59 "no specific time" sentinel), not to "now" —
+        # otherwise a "sin hora" task would pick up whatever time it happens
+        # to be right now, defeating the point of that convention.
+        base = _parse_vikunja_ts(task.get("due_date", "")) or datetime.now(timezone.utc)
+        due_date_iso = (base + timedelta(hours=24)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        due_label = "24 horas más tarde"
+    elif option == "today":
+        due_date_iso, due_label = _day_to_due_iso(date.today()), "hoy, sin hora"
+    else:
+        log.warning("Unknown puntdue option: %s", option)
+        _telegram_call("answerCallbackQuery", callback_query_id=callback_id)
+        return
+
+    try:
+        result_text = _apply_punt(task, task_id, due_date_iso, due_label)
+    except requests.RequestException as e:
+        log.error("Could not punt task %s: %s", task_id, e)
+        _telegram_call(
+            "answerCallbackQuery", callback_query_id=callback_id,
+            text=f"Error: {e}", show_alert=True,
+        )
+        return
+
+    try:
+        _telegram_call(
+            "editMessageText", chat_id=chat_id, message_id=message_id, text=result_text,
+            reply_markup={"inline_keyboard": [[{"text": "↩️ Deshacer", "callback_data": f"undo:{task_id}"}]]},
+        )
+    except (requests.RequestException, RuntimeError) as e:
+        log.error("Could not edit Telegram message: %s", e)
+    _telegram_call("answerCallbackQuery", callback_query_id=callback_id, text="Pospuesta")
+
+
+# ─── Time-entry flow (plain "HH:MM" reply after "⏰ Elegir hora") ───────────
+
+_TIME_RE = re.compile(r"^([01]?\d|2[0-3]):([0-5]\d)$")
+
+
+def _handle_time_entry(chat_id, text: str, pending: dict) -> None:
+    m = _TIME_RE.match(text.strip())
+    if not m:
+        _telegram_call(
+            "sendMessage", chat_id=chat_id,
+            text="Formato inválido. Escribí la hora como HH:MM (ej: 14:30).",
+        )
+        return
+
+    hour, minute = int(m.group(1)), int(m.group(2))
+    due_date_iso = _next_occurrence_iso(hour, minute)
+    due_label = _parse_vikunja_ts(due_date_iso).astimezone().strftime("%Y-%m-%d %H:%M")
+
+    with _state_lock:
+        state = _load_json(PENDING_TIME_STATE_FILE, {})
+        state.pop(str(chat_id), None)
+        _save_json(PENDING_TIME_STATE_FILE, state)
+
+    if pending["kind"] == "newtask":
+        try:
+            _vk_put(
+                f"/projects/{pending['project_id']}/tasks",
+                {"title": pending["title"], "due_date": due_date_iso},
+            )
+        except requests.RequestException as e:
+            log.error("Could not create task: %s", e)
+            _telegram_call("sendMessage", chat_id=chat_id, text=f"Error: {e}")
+            return
+        _telegram_call(
+            "sendMessage", chat_id=chat_id,
+            text=f"✅ Creada: {pending['title']}\nProyecto: {pending['project_title']}\nVencimiento: {due_label}",
+        )
+        log.info("Created task '%s' for chat %s", pending["title"], chat_id)
+        return
+
+    # kind == "punt"
+    task_id = pending["task_id"]
+    try:
+        task = _find_task(task_id)
+    except requests.RequestException as e:
+        log.error("Could not fetch task %s: %s", task_id, e)
+        _telegram_call("sendMessage", chat_id=chat_id, text=f"Error: {e}")
+        return
+    if task is None:
+        _telegram_call("sendMessage", chat_id=chat_id, text="Esa tarea ya no existe")
+        return
+
+    try:
+        result_text = _apply_punt(task, task_id, due_date_iso, due_label)
+    except requests.RequestException as e:
+        log.error("Could not punt task %s: %s", task_id, e)
+        _telegram_call("sendMessage", chat_id=chat_id, text=f"Error: {e}")
+        return
+
+    _telegram_call(
+        "sendMessage", chat_id=chat_id, text=result_text,
+        reply_markup={"inline_keyboard": [[{"text": "↩️ Deshacer", "callback_data": f"undo:{task_id}"}]]},
+    )
 
 
 # ─── Button handling (background thread, continuous) ───────────────────────
@@ -715,6 +957,12 @@ def _handle_callback(callback: dict) -> None:
     if action == "undo":
         _handle_undo(callback_id, chat_id, message_id, payload)
         return
+    if action == "punt":
+        _handle_punt_pick(callback_id, chat_id, message_id, payload)
+        return
+    if action == "puntdue":
+        _handle_punt_due(callback_id, chat_id, message_id, payload)
+        return
     task_id = int(payload)
 
     try:
@@ -742,16 +990,15 @@ def _handle_callback(callback: dict) -> None:
         elif action == "delete":
             _vk_delete(f"/tasks/{task_id}")
             result_text = f"🗑️ {task['title']} — borrada"
-        elif action in ("snooze10", "snooze60"):
-            delta = timedelta(minutes=10) if action == "snooze10" else timedelta(hours=1)
+        elif action in ("snooze10", "snooze60", "snooze1440"):
+            delta = {
+                "snooze10": timedelta(minutes=10),
+                "snooze60": timedelta(hours=1),
+                "snooze1440": timedelta(hours=24),
+            }[action]
             new_dt = datetime.now(timezone.utc) + delta
             _vk_task_update(task_id, {"due_date": new_dt.strftime("%Y-%m-%dT%H:%M:%SZ")})
-            result_text = f"⏰ {task['title']} — pospuesta a las {new_dt.astimezone().strftime('%H:%M')}"
-        elif action == "snooze9am":
-            target = _next_9am(datetime.now())
-            new_dt = target.astimezone(timezone.utc)
-            _vk_task_update(task_id, {"due_date": new_dt.strftime("%Y-%m-%dT%H:%M:%SZ")})
-            result_text = f"⏰ {task['title']} — pospuesta a {target.strftime('%Y-%m-%d %H:%M')}"
+            result_text = f"⏰ {task['title']} — pospuesta a las {new_dt.astimezone().strftime('%Y-%m-%d %H:%M')}"
         elif action == "snoozeday":
             _vk_task_update(task_id, {"due_date": _day_to_due_iso(date.today())})
             result_text = f"⏰ {task['title']} — pospuesta a hoy, sin hora fija"
@@ -864,8 +1111,36 @@ def _handle_message(message: dict) -> None:
         log.info("Sent /borrar task picker (%d task(s)) to chat %s", len(tasks), chat_id)
         return
 
+    if command in ("/punt", "/postergar"):
+        try:
+            tasks = _overdue_tasks() + _today_tasks()
+        except requests.RequestException as e:
+            log.error("Could not fetch tasks for /punt: %s", e)
+            _telegram_call("sendMessage", chat_id=chat_id, text=f"Error: {e}")
+            return
+
+        if not tasks:
+            _telegram_call("sendMessage", chat_id=chat_id, text="🎉 No hay tareas vencidas ni de hoy para posponer.")
+            return
+
+        _telegram_call(
+            "sendMessage", chat_id=chat_id, text="¿Qué tarea posponemos?",
+            reply_markup=_task_picker_keyboard(
+                tasks, "punt", label_fn=lambda t, pm: _punt_button_label(t, pm, date.today())
+            ),
+        )
+        log.info("Sent /punt task picker (%d task(s)) to chat %s", len(tasks), chat_id)
+        return
+
     if text.startswith("/"):
         return
+
+    pending_time_state = _load_json(PENDING_TIME_STATE_FILE, {})
+    pending_time = pending_time_state.get(str(chat_id))
+    if pending_time:
+        _handle_time_entry(chat_id, text, pending_time)
+        return
+
     _start_new_task(chat_id, text)
 
 
@@ -919,6 +1194,7 @@ def main() -> None:
                 {"command": "tomorrow", "description": "Tareas de mañana"},
                 {"command": "hecho", "description": "Marcar una tarea de hoy como hecha"},
                 {"command": "borrar", "description": "Borrar una tarea de hoy"},
+                {"command": "punt", "description": "Posponer una tarea vencida o de hoy"},
             ],
         )
     except (requests.RequestException, RuntimeError) as e:
