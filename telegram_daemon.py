@@ -279,6 +279,33 @@ def _project_title_map() -> dict:
     return {p["id"]: _project_display(p) for p in _real_projects()}
 
 
+_ESTIMATE_RE = re.compile(r"^\[([^\]]*)\]")
+
+
+def _parse_estimate_minutes(title: str) -> Optional[int]:
+    """Parse a leading '[5m]' / '[1h30m]' / '[0]' estimate prefix into minutes,
+    or None if the title has no such prefix (or it doesn't parse)."""
+    m = _ESTIMATE_RE.match(title.strip())
+    if not m:
+        return None
+    content = m.group(1)
+    if content == "0":
+        return 0
+    hm = re.fullmatch(r"(?:(\d+)h)?(?:(\d+)m)?", content)
+    if not hm or not (hm.group(1) or hm.group(2)):
+        return None
+    return int(hm.group(1) or 0) * 60 + int(hm.group(2) or 0)
+
+
+def _format_minutes(total: int) -> str:
+    h, m = divmod(total, 60)
+    if h and m:
+        return f"{h}h{m}m"
+    if h:
+        return f"{h}h"
+    return f"{m}m"
+
+
 def _format_day_message(tasks: list, label: str, overdue: Optional[list] = None) -> str:
     overdue = overdue or []
     if not tasks and not overdue:
@@ -305,6 +332,14 @@ def _format_day_message(tasks: list, label: str, overdue: Optional[list] = None)
             time_str = due_dt.astimezone().strftime("%H:%M") if due_dt else "──"
             project_title = project_map.get(t.get("project_id"), _INBOX_LABEL)
             lines.append(f"🕐 {time_str}  {html.escape(t['title'])} · {html.escape(project_title)}")
+
+        estimates = [_parse_estimate_minutes(t["title"]) for t in tasks]
+        missing = estimates.count(None)
+        total = sum(e for e in estimates if e is not None)
+        lines.append("")
+        lines.append(f"⏱ Total estimado: {_format_minutes(total)}")
+        if missing:
+            lines.append(f"⚠️ {missing} tarea(s) sin estimación")
     elif overdue:
         lines.append(f"🎉 No hay tareas para {label} (aparte de las vencidas).")
 

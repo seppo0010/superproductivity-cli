@@ -278,6 +278,33 @@ def _format_due(task: dict) -> str:
     return _format_dt_due(_parse_vikunja_ts(task.get("due_date", "")))
 
 
+_ESTIMATE_RE = re.compile(r"^\[([^\]]*)\]")
+
+
+def _parse_estimate_minutes(title: str) -> Optional[int]:
+    """Parse a leading '[5m]' / '[1h30m]' / '[0]' estimate prefix into minutes,
+    or None if the title has no such prefix (or it doesn't parse)."""
+    m = _ESTIMATE_RE.match(title.strip())
+    if not m:
+        return None
+    content = m.group(1)
+    if content == "0":
+        return 0
+    hm = re.fullmatch(r"(?:(\d+)h)?(?:(\d+)m)?", content)
+    if not hm or not (hm.group(1) or hm.group(2)):
+        return None
+    return int(hm.group(1) or 0) * 60 + int(hm.group(2) or 0)
+
+
+def _format_minutes(total: int) -> str:
+    h, m = divmod(total, 60)
+    if h and m:
+        return f"{h}h{m}m"
+    if h:
+        return f"{h}h"
+    return f"{m}m"
+
+
 def _match_project(name: str, all_projects: list) -> int:
     """Return a project ID from a name substring. Interactive picker if ambiguous."""
     hits = [p for p in all_projects if name.lower() in p["title"].lower()]
@@ -571,6 +598,14 @@ def list_tasks(
 
     render_console.print(table)
     console.print(f"[dim]{len(tasks)} task(s)[/dim]")
+
+    if due:
+        estimates = [_parse_estimate_minutes(t["title"]) for t in tasks if not t.get("done")]
+        missing = estimates.count(None)
+        total = sum(e for e in estimates if e is not None)
+        console.print(f"[bold]Estimado:[/bold] {_format_minutes(total)}")
+        if missing:
+            console.print(f"[yellow]⚠ {missing} tarea(s) sin estimación[/yellow]")
 
 
 @app.command()
