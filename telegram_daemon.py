@@ -231,6 +231,20 @@ def _tasks_for_date(day: date) -> list:
     return result
 
 
+def _parse_day_arg(arg: str) -> Optional[date]:
+    """Parse a /day argument: 'hoy'/'today', 'mañana'/'manana'/'tomorrow', or
+    an explicit YYYY-MM-DD. None if unparseable."""
+    arg = arg.strip().lower()
+    if arg in ("hoy", "today"):
+        return date.today()
+    if arg in ("mañana", "manana", "tomorrow"):
+        return date.today() + timedelta(days=1)
+    try:
+        return datetime.strptime(arg, "%Y-%m-%d").date()
+    except ValueError:
+        return None
+
+
 def _today_tasks() -> list:
     return _tasks_for_date(date.today())
 
@@ -1073,7 +1087,9 @@ def _handle_message(message: dict) -> None:
     if not text:
         return
 
-    command = text.split("@", 1)[0]
+    parts = text.split(maxsplit=1)
+    command = parts[0].split("@", 1)[0]
+    arg = parts[1].strip() if len(parts) > 1 else ""
 
     if command in ("/hoy", "/today"):
         try:
@@ -1106,6 +1122,29 @@ def _handle_message(message: dict) -> None:
             "sendMessage", chat_id=chat_id, text=_format_day_message(tasks, "mañana"), parse_mode="HTML"
         )
         log.info("Sent tomorrow's task list (%d task(s)) to chat %s", len(tasks), chat_id)
+        return
+
+    if command in ("/day", "/dia"):
+        target = _parse_day_arg(arg)
+        if target is None:
+            _telegram_call(
+                "sendMessage", chat_id=chat_id,
+                text="Usá /day YYYY-MM-DD (o 'hoy' / 'mañana'). Ej: /day 2026-08-20",
+            )
+            return
+
+        try:
+            tasks = _tasks_for_date(target)
+        except requests.RequestException as e:
+            log.error("Could not fetch tasks for %s: %s", target, e)
+            _telegram_call("sendMessage", chat_id=chat_id, text=f"Error: {e}")
+            return
+
+        label = target.strftime("%Y-%m-%d")
+        _telegram_call(
+            "sendMessage", chat_id=chat_id, text=_format_day_message(tasks, label), parse_mode="HTML"
+        )
+        log.info("Sent task list for %s (%d task(s)) to chat %s", label, len(tasks), chat_id)
         return
 
     if command == "/hecho":
@@ -1227,6 +1266,7 @@ def main() -> None:
             commands=[
                 {"command": "hoy", "description": "Tareas de hoy"},
                 {"command": "tomorrow", "description": "Tareas de mañana"},
+                {"command": "day", "description": "Tareas de una fecha (YYYY-MM-DD)"},
                 {"command": "hecho", "description": "Marcar una tarea de hoy como hecha"},
                 {"command": "borrar", "description": "Borrar una tarea de hoy"},
                 {"command": "punt", "description": "Posponer una tarea vencida o de hoy"},
