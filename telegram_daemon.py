@@ -394,6 +394,11 @@ def _format_availability_config() -> str:
     return "\n".join(lines)
 
 
+def _labels_text(task: dict) -> str:
+    titles = [l["title"] for l in (task.get("labels") or [])]
+    return f" · 🏷 {html.escape(', '.join(titles))}" if titles else ""
+
+
 def _format_day_message(tasks: list, label: str, overdue: Optional[list] = None, day: Optional[date] = None) -> str:
     overdue = overdue or []
     if not tasks and not overdue:
@@ -409,7 +414,7 @@ def _format_day_message(tasks: list, label: str, overdue: Optional[list] = None,
             due_date = _task_local_date(t)
             date_str = due_date.strftime("%Y-%m-%d") if due_date else "──"
             project_title = project_map.get(t.get("project_id"), _INBOX_LABEL)
-            lines.append(f"⚠️ {date_str}  {html.escape(t['title'])} · {html.escape(project_title)}")
+            lines.append(f"⚠️ {date_str}  {html.escape(t['title'])} · {html.escape(project_title)}{_labels_text(t)}")
         lines.append("")
 
     if tasks:
@@ -419,7 +424,7 @@ def _format_day_message(tasks: list, label: str, overdue: Optional[list] = None,
             due_dt = _task_due_dt(t)
             time_str = due_dt.astimezone().strftime("%H:%M") if due_dt else "──"
             project_title = project_map.get(t.get("project_id"), _INBOX_LABEL)
-            lines.append(f"🕐 {time_str}  {html.escape(t['title'])} · {html.escape(project_title)}")
+            lines.append(f"🕐 {time_str}  {html.escape(t['title'])} · {html.escape(project_title)}{_labels_text(t)}")
 
         estimates = [_parse_estimate_minutes(t["title"]) for t in tasks]
         missing = estimates.count(None)
