@@ -321,6 +321,26 @@ def _format_minutes(total: int) -> str:
     return f"{m}m"
 
 
+_TARJETA_LABEL_TITLE = "Para tarjeta"
+
+
+def _find_label_by_title(title: str) -> Optional[dict]:
+    labels: list = _vk_get("/labels")
+    return next((l for l in labels if l["title"] == title), None)
+
+
+def _zero_out_estimate(title: str) -> str:
+    """Replace the leading '[...]' estimate prefix with '[0]' (or add one if
+    there's none)."""
+    stripped = title.strip()
+    m = _ESTIMATE_RE.match(stripped)
+    if m:
+        rest = stripped[m.end():].lstrip()
+    else:
+        rest = stripped
+    return f"[0] {rest}" if rest else "[0]"
+
+
 _WEEKDAY_NAMES = {
     "lunes": 0, "martes": 1, "miercoles": 2, "miércoles": 2, "jueves": 3,
     "viernes": 4, "sabado": 5, "sábado": 5, "domingo": 6,
@@ -1040,6 +1060,13 @@ def _handle_undo(callback_id: str, chat_id, message_id, payload: str) -> None:
             for label in prev_task.get("labels") or []:
                 _vk_put(f"/tasks/{created['id']}/labels", {"label_id": label["id"]})
             result_text = f"↩️ {prev_task['title']} — restaurada"
+        elif entry["action"] == "tarjeta":
+            _vk_task_update(prev_task["id"], {"title": prev_task["title"]})
+            prev_label_ids = {l["id"] for l in prev_task.get("labels") or []}
+            label_obj = _find_label_by_title(_TARJETA_LABEL_TITLE)
+            if label_obj is not None and label_obj["id"] not in prev_label_ids:
+                _vk_delete(f"/tasks/{prev_task['id']}/labels/{label_obj['id']}")
+            result_text = f"↩️ {prev_task['title']} — deshecho"
         else:
             # done/snooze* only ever touch these two fields, so restoring
             # both from the pre-action snapshot reverses any of them.
@@ -1048,7 +1075,7 @@ def _handle_undo(callback_id: str, chat_id, message_id, payload: str) -> None:
                 "due_date": prev_task.get("due_date") or "",
             })
             result_text = f"↩️ {prev_task['title']} — deshecho"
-    except requests.RequestException as e:
+    except (requests.RequestException, RuntimeError) as e:
         log.error("Could not undo action for task %s: %s", payload, e)
         _telegram_call(
             "answerCallbackQuery", callback_query_id=callback_id,
@@ -1136,11 +1163,21 @@ def _handle_callback(callback: dict) -> None:
         elif action == "snoozeday":
             _vk_task_update(task_id, {"due_date": _day_to_due_iso(date.today())})
             result_text = f"⏰ {task['title']} — pospuesta a hoy, sin hora fija"
+        elif action == "tarjeta":
+            label_obj = _find_label_by_title(_TARJETA_LABEL_TITLE)
+            if label_obj is None:
+                raise RuntimeError(f'No existe el label "{_TARJETA_LABEL_TITLE}" en Vikunja')
+            if not any(l["id"] == label_obj["id"] for l in task.get("labels") or []):
+                _vk_put(f"/tasks/{task_id}/labels", {"label_id": label_obj["id"]})
+            new_title = _zero_out_estimate(task["title"])
+            if new_title != task["title"]:
+                _vk_task_update(task_id, {"title": new_title})
+            result_text = f'💳 {new_title} — etiquetada "{_TARJETA_LABEL_TITLE}", estimado a 0'
         else:
             log.warning("Unknown action: %s", action)
             _telegram_call("answerCallbackQuery", callback_query_id=callback_id)
             return
-    except requests.RequestException as e:
+    except (requests.RequestException, RuntimeError) as e:
         log.error("Could not apply action %s to task %s: %s", action, task_id, e)
         _telegram_call(
             "answerCallbackQuery", callback_query_id=callback_id,
@@ -1339,6 +1376,25 @@ def _handle_message(message: dict) -> None:
         log.info("Sent /borrar task picker (%d task(s)) to chat %s", len(tasks), chat_id)
         return
 
+    if command == "/tarjeta":
+        try:
+            tasks = _today_tasks()
+        except requests.RequestException as e:
+            log.error("Could not fetch today's tasks: %s", e)
+            _telegram_call("sendMessage", chat_id=chat_id, text=f"Error: {e}")
+            return
+
+        if not tasks:
+            _telegram_call("sendMessage", chat_id=chat_id, text="🎉 No hay tareas pendientes hoy.")
+            return
+
+        _telegram_call(
+            "sendMessage", chat_id=chat_id, text=f'¿Qué tarea marcamos "{_TARJETA_LABEL_TITLE}"?',
+            reply_markup=_task_picker_keyboard(tasks, "tarjeta"),
+        )
+        log.info("Sent /tarjeta task picker (%d task(s)) to chat %s", len(tasks), chat_id)
+        return
+
     if command in ("/punt", "/postergar"):
         try:
             tasks = _overdue_tasks() + _today_tasks()
@@ -1424,6 +1480,7 @@ def main() -> None:
                 {"command": "disponibilidad", "description": "Ver o configurar horas disponibles por día"},
                 {"command": "hecho", "description": "Marcar una tarea de hoy como hecha"},
                 {"command": "borrar", "description": "Borrar una tarea de hoy"},
+                {"command": "tarjeta", "description": 'Etiquetar "Para tarjeta" y poner estimado en 0'},
                 {"command": "punt", "description": "Posponer una tarea vencida o de hoy"},
             ],
         )
