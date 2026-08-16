@@ -232,6 +232,20 @@ def _tasks_for_date(day: date) -> list:
     return result
 
 
+def _tasks_by_date(start: date, days: int) -> dict:
+    """Active tasks due within [start, start+days-1], grouped by local
+    calendar day. A single /tasks fetch, unlike calling _tasks_for_date once
+    per day."""
+    end = start + timedelta(days=days - 1)
+    tasks: list = _vk_get("/tasks", {"filter": "done = false"})
+    by_date: dict = {}
+    for t in tasks:
+        d = _task_local_date(t)
+        if d is not None and start <= d <= end:
+            by_date.setdefault(d, []).append(t)
+    return by_date
+
+
 def _parse_day_arg(arg: str) -> Optional[date]:
     """Parse a /day argument: 'hoy'/'today', 'mañana'/'manana'/'tomorrow', or
     an explicit YYYY-MM-DD. None if unparseable."""
@@ -346,6 +360,7 @@ _WEEKDAY_NAMES = {
     "viernes": 4, "sabado": 5, "sábado": 5, "domingo": 6,
 }
 _WEEKDAY_DISPLAY = ["Lunes", "Martes", "Miércoles", "Jueves", "Viernes", "Sábado", "Domingo"]
+_WEEKDAY_SHORT = ["Lun", "Mar", "Mié", "Jue", "Vie", "Sáb", "Dom"]
 
 
 def _parse_duration_minutes(s: str) -> Optional[int]:
@@ -466,6 +481,36 @@ def _format_day_message(tasks: list, label: str, overdue: Optional[list] = None,
             lines.append(f"⚠️ {missing} tarea(s) sin estimación")
     elif overdue:
         lines.append(f"🎉 No hay tareas para {label} (aparte de las vencidas).")
+
+    return "\n".join(lines)
+
+
+def _format_load_message(by_date: dict, start: date, days: int) -> str:
+    """Per-day estimated load vs configured availability, for spotting
+    overloaded days ahead of time (and free ones worth pulling tasks into)."""
+    lines = [f"📊 <b>Carga de los próximos {days} día(s)</b>", ""]
+    for i in range(days):
+        day = start + timedelta(days=i)
+        day_tasks = by_date.get(day, [])
+        day_label = f"{_WEEKDAY_SHORT[day.weekday()]} {day.strftime('%m-%d')}"
+
+        if not day_tasks:
+            lines.append(f"{day_label}: sin tareas")
+            continue
+
+        estimates = [_parse_estimate_minutes(t["title"]) for t in day_tasks]
+        missing = estimates.count(None)
+        total = sum(e for e in estimates if e is not None)
+        capacity = _availability_minutes_for(day)
+
+        summary = f"{len(day_tasks)} tarea(s) · {_format_minutes(total)}"
+        if capacity is not None:
+            summary += f" / {_format_minutes(capacity)}"
+            if total > capacity:
+                summary += f" 🚨 +{_format_minutes(total - capacity)}"
+        if missing:
+            summary += f" ⚠️{missing}"
+        lines.append(f"{day_label}: {summary}")
 
     return "\n".join(lines)
 
@@ -1276,6 +1321,33 @@ def _handle_message(message: dict) -> None:
         log.info("Sent task list for %s (%d task(s)) to chat %s", label, len(tasks), chat_id)
         return
 
+    if command in ("/carga", "/semana"):
+        days = 7
+        if arg:
+            try:
+                days = int(arg)
+            except ValueError:
+                _telegram_call(
+                    "sendMessage", chat_id=chat_id,
+                    text="Usá /carga [días]. Ej: /carga o /carga 14",
+                )
+                return
+        days = max(1, min(days, 30))
+
+        start = date.today()
+        try:
+            by_date = _tasks_by_date(start, days)
+        except requests.RequestException as e:
+            log.error("Could not fetch tasks for /carga: %s", e)
+            _telegram_call("sendMessage", chat_id=chat_id, text=f"Error: {e}")
+            return
+
+        _telegram_call(
+            "sendMessage", chat_id=chat_id, text=_format_load_message(by_date, start, days), parse_mode="HTML"
+        )
+        log.info("Sent %d-day load overview to chat %s", days, chat_id)
+        return
+
     if command in ("/disponibilidad", "/disp"):
         if not arg:
             _telegram_call(
@@ -1482,6 +1554,7 @@ def main() -> None:
                 {"command": "hoy", "description": "Tareas de hoy"},
                 {"command": "tomorrow", "description": "Tareas de mañana"},
                 {"command": "day", "description": "Tareas de una fecha (YYYY-MM-DD)"},
+                {"command": "carga", "description": "Carga estimada de los próximos días"},
                 {"command": "disponibilidad", "description": "Ver o configurar horas disponibles por día"},
                 {"command": "hecho", "description": "Marcar una tarea de hoy como hecha"},
                 {"command": "borrar", "description": "Borrar una tarea de hoy"},
