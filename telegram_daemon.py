@@ -1322,14 +1322,14 @@ def _handle_message(message: dict) -> None:
         return
 
     if command in ("/carga", "/semana"):
-        days = 7
+        days = 14
         if arg:
             try:
                 days = int(arg)
             except ValueError:
                 _telegram_call(
                     "sendMessage", chat_id=chat_id,
-                    text="Usá /carga [días]. Ej: /carga o /carga 14",
+                    text="Usá /carga [días]. Ej: /carga o /carga 21",
                 )
                 return
         days = max(1, min(days, 30))
