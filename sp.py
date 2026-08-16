@@ -15,6 +15,7 @@ Tip: alias sp='python /path/to/sp.py'
 
 from __future__ import annotations
 
+import json
 import os
 import re
 import sys
@@ -62,6 +63,9 @@ API_BASE = f"{VIKUNJA_URL}/api/v1"
 TOKEN = os.environ.get("VIKUNJA_TOKEN")
 INBOX_PROJECT_TITLE = "Inbox"
 MIN_TABLE_WIDTH = 80
+
+STATE_DIR = Path(os.environ.get("SP_CLI_STATE_DIR", Path.home() / ".config" / "sp-cli"))
+AVAILABILITY_STATE_FILE = STATE_DIR / "availability.json"
 
 
 # ─── HTTP helpers ─────────────────────────────────────────────────────────────
@@ -303,6 +307,23 @@ def _format_minutes(total: int) -> str:
     if h:
         return f"{h}h"
     return f"{m}m"
+
+
+def _availability_minutes_for(day: date) -> Optional[int]:
+    """Availability configured via the Telegram bot's /disponibilidad command
+    (shared state file). A specific date overrides the weekday default; None
+    means no limit has been configured for that day."""
+    try:
+        config = json.loads(AVAILABILITY_STATE_FILE.read_text())
+    except (OSError, json.JSONDecodeError):
+        return None
+    date_key = day.strftime("%Y-%m-%d")
+    if date_key in config.get("date", {}):
+        return config["date"][date_key]
+    weekday_key = str(day.weekday())
+    if weekday_key in config.get("weekday", {}):
+        return config["weekday"][weekday_key]
+    return None
 
 
 def _match_project(name: str, all_projects: list) -> int:
@@ -603,7 +624,13 @@ def list_tasks(
         estimates = [_parse_estimate_minutes(t["title"]) for t in tasks if not t.get("done")]
         missing = estimates.count(None)
         total = sum(e for e in estimates if e is not None)
-        console.print(f"[bold]Estimado:[/bold] {_format_minutes(total)}")
+        capacity = _availability_minutes_for(datetime.strptime(due_day, "%Y-%m-%d").date())
+        if capacity is None:
+            console.print(f"[bold]Estimado:[/bold] {_format_minutes(total)}")
+        else:
+            console.print(f"[bold]Estimado:[/bold] {_format_minutes(total)}  (disponible: {_format_minutes(capacity)})")
+            if total > capacity:
+                console.print(f"[bold red]🚨 Te pasaste por {_format_minutes(total - capacity)}[/bold red]")
         if missing:
             console.print(f"[yellow]⚠ {missing} tarea(s) sin estimación[/yellow]")
 

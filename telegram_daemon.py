@@ -60,6 +60,7 @@ DAILY_DIGEST_STATE_FILE = STATE_DIR / "daily_digest_state.json"
 PENDING_TASK_STATE_FILE = STATE_DIR / "pending_task_state.json"
 PENDING_TIME_STATE_FILE = STATE_DIR / "pending_time_state.json"
 UNDO_STATE_FILE = STATE_DIR / "undo_state.json"
+AVAILABILITY_STATE_FILE = STATE_DIR / "availability.json"
 DAILY_DIGEST_HOUR = 6
 
 TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
@@ -320,7 +321,80 @@ def _format_minutes(total: int) -> str:
     return f"{m}m"
 
 
-def _format_day_message(tasks: list, label: str, overdue: Optional[list] = None) -> str:
+_WEEKDAY_NAMES = {
+    "lunes": 0, "martes": 1, "miercoles": 2, "miércoles": 2, "jueves": 3,
+    "viernes": 4, "sabado": 5, "sábado": 5, "domingo": 6,
+}
+_WEEKDAY_DISPLAY = ["Lunes", "Martes", "Miércoles", "Jueves", "Viernes", "Sábado", "Domingo"]
+
+
+def _parse_duration_minutes(s: str) -> Optional[int]:
+    """Parse a duration like '3h', '7h30m', '0', or a bare number (hours)."""
+    s = s.strip().lower()
+    if not s:
+        return None
+    if s == "0":
+        return 0
+    hm = re.fullmatch(r"(?:(\d+)h)?(?:(\d+)m)?", s)
+    if hm and (hm.group(1) or hm.group(2)):
+        return int(hm.group(1) or 0) * 60 + int(hm.group(2) or 0)
+    if re.fullmatch(r"\d+(\.\d+)?", s):
+        return round(float(s) * 60)
+    return None
+
+
+def _parse_availability_target(s: str) -> Optional[tuple]:
+    """Returns ('weekday', '1') or ('date', '2026-08-21'), or None."""
+    s = s.strip().lower()
+    if s in _WEEKDAY_NAMES:
+        return ("weekday", str(_WEEKDAY_NAMES[s]))
+    try:
+        datetime.strptime(s, "%Y-%m-%d")
+        return ("date", s)
+    except ValueError:
+        return None
+
+
+def _availability_minutes_for(day: date) -> Optional[int]:
+    """A specific date overrides the weekday default. None means no limit
+    has been configured for that day."""
+    config = _load_json(AVAILABILITY_STATE_FILE, {"weekday": {}, "date": {}})
+    date_key = day.strftime("%Y-%m-%d")
+    if date_key in config.get("date", {}):
+        return config["date"][date_key]
+    weekday_key = str(day.weekday())
+    if weekday_key in config.get("weekday", {}):
+        return config["weekday"][weekday_key]
+    return None
+
+
+def _format_availability_config() -> str:
+    config = _load_json(AVAILABILITY_STATE_FILE, {"weekday": {}, "date": {}})
+    lines = ["<b>Disponibilidad configurada</b>", ""]
+
+    weekday_cfg = config.get("weekday", {})
+    if weekday_cfg:
+        for idx in sorted(weekday_cfg, key=int):
+            lines.append(f"{_WEEKDAY_DISPLAY[int(idx)]}: {_format_minutes(weekday_cfg[idx])}")
+    else:
+        lines.append("(sin días de semana configurados)")
+
+    date_cfg = config.get("date", {})
+    if date_cfg:
+        lines.append("")
+        for d in sorted(date_cfg):
+            lines.append(f"{d}: {_format_minutes(date_cfg[d])}")
+
+    lines.append("")
+    lines.append(
+        "Usá /disponibilidad &lt;día|fecha&gt; &lt;horas&gt; para configurar "
+        "(ej: <code>/disponibilidad martes 3h</code>, <code>/disponibilidad 2026-08-21 7h</code>), "
+        "o /disponibilidad borrar &lt;día|fecha&gt; para quitar."
+    )
+    return "\n".join(lines)
+
+
+def _format_day_message(tasks: list, label: str, overdue: Optional[list] = None, day: Optional[date] = None) -> str:
     overdue = overdue or []
     if not tasks and not overdue:
         return f"🎉 No hay tareas para {label}."
@@ -351,7 +425,13 @@ def _format_day_message(tasks: list, label: str, overdue: Optional[list] = None)
         missing = estimates.count(None)
         total = sum(e for e in estimates if e is not None)
         lines.append("")
-        lines.append(f"⏱ Total estimado: {_format_minutes(total)}")
+        capacity = _availability_minutes_for(day) if day is not None else None
+        if capacity is None:
+            lines.append(f"⏱ Total estimado: {_format_minutes(total)}")
+        else:
+            lines.append(f"⏱ Total estimado: {_format_minutes(total)} (disponible: {_format_minutes(capacity)})")
+            if total > capacity:
+                lines.append(f"🚨 Te pasaste por {_format_minutes(total - capacity)}")
         if missing:
             lines.append(f"⚠️ {missing} tarea(s) sin estimación")
     elif overdue:
@@ -590,7 +670,7 @@ def check_daily_digest() -> None:
 
     try:
         _telegram_call(
-            "sendMessage", chat_id=CHAT_ID, text=_format_day_message(tasks, "hoy"), parse_mode="HTML"
+            "sendMessage", chat_id=CHAT_ID, text=_format_day_message(tasks, "hoy", day=date.today()), parse_mode="HTML"
         )
     except (requests.RequestException, RuntimeError) as e:
         log.error("Failed to send daily digest: %s", e)
@@ -1101,7 +1181,7 @@ def _handle_message(message: dict) -> None:
             return
 
         _telegram_call(
-            "sendMessage", chat_id=chat_id, text=_format_day_message(tasks, "hoy", overdue=overdue),
+            "sendMessage", chat_id=chat_id, text=_format_day_message(tasks, "hoy", overdue=overdue, day=date.today()),
             parse_mode="HTML",
         )
         log.info(
@@ -1119,7 +1199,9 @@ def _handle_message(message: dict) -> None:
             return
 
         _telegram_call(
-            "sendMessage", chat_id=chat_id, text=_format_day_message(tasks, "mañana"), parse_mode="HTML"
+            "sendMessage", chat_id=chat_id,
+            text=_format_day_message(tasks, "mañana", day=date.today() + timedelta(days=1)),
+            parse_mode="HTML",
         )
         log.info("Sent tomorrow's task list (%d task(s)) to chat %s", len(tasks), chat_id)
         return
@@ -1142,9 +1224,76 @@ def _handle_message(message: dict) -> None:
 
         label = target.strftime("%Y-%m-%d")
         _telegram_call(
-            "sendMessage", chat_id=chat_id, text=_format_day_message(tasks, label), parse_mode="HTML"
+            "sendMessage", chat_id=chat_id, text=_format_day_message(tasks, label, day=target), parse_mode="HTML"
         )
         log.info("Sent task list for %s (%d task(s)) to chat %s", label, len(tasks), chat_id)
+        return
+
+    if command in ("/disponibilidad", "/disp"):
+        if not arg:
+            _telegram_call(
+                "sendMessage", chat_id=chat_id, text=_format_availability_config(), parse_mode="HTML"
+            )
+            return
+
+        args = arg.split(maxsplit=1)
+
+        if args[0] == "borrar":
+            if len(args) < 2:
+                _telegram_call(
+                    "sendMessage", chat_id=chat_id,
+                    text="Usá /disponibilidad borrar <día|fecha>. Ej: /disponibilidad borrar martes",
+                )
+                return
+            target = _parse_availability_target(args[1])
+            if target is None:
+                _telegram_call(
+                    "sendMessage", chat_id=chat_id,
+                    text="No entendí el día/fecha. Usá un día de la semana o YYYY-MM-DD.",
+                )
+                return
+            kind, key = target
+            with _state_lock:
+                config = _load_json(AVAILABILITY_STATE_FILE, {"weekday": {}, "date": {}})
+                config.setdefault(kind, {}).pop(key, None)
+                _save_json(AVAILABILITY_STATE_FILE, config)
+            _telegram_call("sendMessage", chat_id=chat_id, text=f"✓ Disponibilidad de {args[1]} eliminada.")
+            log.info("Cleared availability override %s=%s for chat %s", kind, key, chat_id)
+            return
+
+        if len(args) != 2:
+            _telegram_call(
+                "sendMessage", chat_id=chat_id,
+                text=(
+                    "Usá /disponibilidad <día|fecha> <horas>. "
+                    "Ej: /disponibilidad martes 3h, /disponibilidad 2026-08-21 7h"
+                ),
+            )
+            return
+
+        target = _parse_availability_target(args[0])
+        minutes = _parse_duration_minutes(args[1])
+        if target is None or minutes is None:
+            _telegram_call(
+                "sendMessage", chat_id=chat_id,
+                text=(
+                    "No entendí. Usá /disponibilidad <día|fecha> <horas>. "
+                    "Ej: /disponibilidad martes 3h, /disponibilidad 2026-08-21 7h"
+                ),
+            )
+            return
+
+        kind, key = target
+        with _state_lock:
+            config = _load_json(AVAILABILITY_STATE_FILE, {"weekday": {}, "date": {}})
+            config.setdefault(kind, {})[key] = minutes
+            _save_json(AVAILABILITY_STATE_FILE, config)
+
+        label = _WEEKDAY_DISPLAY[int(key)] if kind == "weekday" else key
+        _telegram_call(
+            "sendMessage", chat_id=chat_id, text=f"✓ Disponibilidad de {label}: {_format_minutes(minutes)}"
+        )
+        log.info("Set availability %s=%s to %d min for chat %s", kind, key, minutes, chat_id)
         return
 
     if command == "/hecho":
@@ -1267,6 +1416,7 @@ def main() -> None:
                 {"command": "hoy", "description": "Tareas de hoy"},
                 {"command": "tomorrow", "description": "Tareas de mañana"},
                 {"command": "day", "description": "Tareas de una fecha (YYYY-MM-DD)"},
+                {"command": "disponibilidad", "description": "Ver o configurar horas disponibles por día"},
                 {"command": "hecho", "description": "Marcar una tarea de hoy como hecha"},
                 {"command": "borrar", "description": "Borrar una tarea de hoy"},
                 {"command": "punt", "description": "Posponer una tarea vencida o de hoy"},
