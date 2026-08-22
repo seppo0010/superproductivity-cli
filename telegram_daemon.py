@@ -225,10 +225,15 @@ def _next_occurrence_iso(hour: int, minute: int) -> str:
 
 
 def _tasks_for_date(day: date) -> list:
-    """Active tasks due on `day`, sorted by time (day-only tasks first)."""
+    """Active tasks due on `day`, sorted by time (day-only tasks first),
+    then by project title to keep same-time ties stable and grouped."""
     tasks: list = _vk_get("/tasks", {"filter": "done = false"})
     result = [t for t in tasks if _task_local_date(t) == day]
-    result.sort(key=lambda t: (_task_due_dt(t) or datetime.min.replace(tzinfo=timezone.utc)))
+    project_map = _project_title_map()
+    result.sort(key=lambda t: (
+        _task_due_dt(t) or datetime.min.replace(tzinfo=timezone.utc),
+        project_map.get(t.get("project_id"), _INBOX_LABEL),
+    ))
     return result
 
 
@@ -343,16 +348,28 @@ def _find_label_by_title(title: str) -> Optional[dict]:
     return next((l for l in labels if l["title"] == title), None)
 
 
-def _zero_out_estimate(title: str) -> str:
-    """Replace the leading '[...]' estimate prefix with '[0]' (or add one if
-    there's none)."""
+def _set_estimate(title: str, minutes: int) -> str:
+    """Replace the leading '[...]' estimate prefix with one for `minutes`
+    (or add one if there's none)."""
     stripped = title.strip()
     m = _ESTIMATE_RE.match(stripped)
-    if m:
-        rest = stripped[m.end():].lstrip()
-    else:
-        rest = stripped
-    return f"[0] {rest}" if rest else "[0]"
+    rest = stripped[m.end():].lstrip() if m else stripped
+    prefix = "[0]" if minutes == 0 else f"[{_format_minutes(minutes)}]"
+    return f"{prefix} {rest}" if rest else prefix
+
+
+_ESTIMATE_OPTIONS = [(5, "5m"), (10, "10m"), (15, "15m"), (60, "1h"), (120, "2h")]
+
+
+def _estimate_duration_keyboard(task_id: int) -> dict:
+    rows = [
+        [
+            {"text": label, "callback_data": f"estimdur:{task_id}:{minutes}"}
+            for minutes, label in _ESTIMATE_OPTIONS[i:i + 3]
+        ]
+        for i in range(0, len(_ESTIMATE_OPTIONS), 3)
+    ]
+    return {"inline_keyboard": rows + [[{"text": "❌ Cancelar", "callback_data": "hcancel:0"}]]}
 
 
 _WEEKDAY_NAMES = {
@@ -1017,6 +1034,100 @@ def _handle_punt_due(callback_id: str, chat_id, message_id, payload: str) -> Non
     _telegram_call("answerCallbackQuery", callback_query_id=callback_id, text="Pospuesta")
 
 
+# ─── Estimate flow (set/change a task's duration estimate) ────────────────
+
+def _handle_estimate_pick(callback_id: str, chat_id, message_id, payload: str) -> None:
+    try:
+        task_id = int(payload)
+    except ValueError:
+        _telegram_call(
+            "answerCallbackQuery", callback_query_id=callback_id,
+            text="Opción inválida", show_alert=True,
+        )
+        return
+
+    try:
+        task = _find_task(task_id)
+    except requests.RequestException as e:
+        log.error("Could not fetch task %s: %s", task_id, e)
+        _telegram_call(
+            "answerCallbackQuery", callback_query_id=callback_id,
+            text=f"Error: {e}", show_alert=True,
+        )
+        return
+
+    if task is None:
+        log.warning("Task %s no longer exists", task_id)
+        _telegram_call(
+            "answerCallbackQuery", callback_query_id=callback_id,
+            text="Esa tarea ya no existe", show_alert=True,
+        )
+        return
+
+    _telegram_call(
+        "editMessageText", chat_id=chat_id, message_id=message_id,
+        text=f"⏱ {task['title']}\n¿Cuánto estimás que dura?",
+        reply_markup=_estimate_duration_keyboard(task_id),
+    )
+    _telegram_call("answerCallbackQuery", callback_query_id=callback_id)
+
+
+def _handle_estimate_duration(callback_id: str, chat_id, message_id, payload: str) -> None:
+    try:
+        task_id_str, minutes_str = payload.split(":", 1)
+        task_id, minutes = int(task_id_str), int(minutes_str)
+    except ValueError:
+        log.warning("Malformed estimdur payload: %s", payload)
+        _telegram_call("answerCallbackQuery", callback_query_id=callback_id)
+        return
+
+    try:
+        task = _find_task(task_id)
+    except requests.RequestException as e:
+        log.error("Could not fetch task %s: %s", task_id, e)
+        _telegram_call(
+            "answerCallbackQuery", callback_query_id=callback_id,
+            text=f"Error: {e}", show_alert=True,
+        )
+        return
+
+    if task is None:
+        log.warning("Task %s no longer exists", task_id)
+        _telegram_call(
+            "answerCallbackQuery", callback_query_id=callback_id,
+            text="Esa tarea ya no existe", show_alert=True,
+        )
+        return
+
+    new_title = _set_estimate(task["title"], minutes)
+    try:
+        if new_title != task["title"]:
+            _vk_task_update(task_id, {"title": new_title})
+    except requests.RequestException as e:
+        log.error("Could not update estimate for task %s: %s", task_id, e)
+        _telegram_call(
+            "answerCallbackQuery", callback_query_id=callback_id,
+            text=f"Error: {e}", show_alert=True,
+        )
+        return
+
+    with _state_lock:
+        state = _load_json(UNDO_STATE_FILE, {})
+        state[str(task_id)] = {"action": "estimate", "task": task}
+        _save_json(UNDO_STATE_FILE, state)
+
+    result_text = f"⏱ {new_title} — estimado en {_format_minutes(minutes)}"
+    try:
+        _telegram_call(
+            "editMessageText", chat_id=chat_id, message_id=message_id, text=result_text,
+            reply_markup={"inline_keyboard": [[{"text": "↩️ Deshacer", "callback_data": f"undo:{task_id}"}]]},
+        )
+    except (requests.RequestException, RuntimeError) as e:
+        log.error("Could not edit Telegram message: %s", e)
+    _telegram_call("answerCallbackQuery", callback_query_id=callback_id, text="Estimado")
+    log.info("Set estimate for task %s to %d min", task_id, minutes)
+
+
 # ─── Time-entry flow (plain "HH:MM" reply after "⏰ Elegir hora") ───────────
 
 _TIME_RE = re.compile(r"^([01]?\d|2[0-3]):([0-5]\d)$")
@@ -1117,6 +1228,9 @@ def _handle_undo(callback_id: str, chat_id, message_id, payload: str) -> None:
             if label_obj is not None and label_obj["id"] not in prev_label_ids:
                 _vk_delete(f"/tasks/{prev_task['id']}/labels/{label_obj['id']}")
             result_text = f"↩️ {prev_task['title']} — deshecho"
+        elif entry["action"] == "estimate":
+            _vk_task_update(prev_task["id"], {"title": prev_task["title"]})
+            result_text = f"↩️ {prev_task['title']} — deshecho"
         else:
             # done/snooze* only ever touch these two fields, so restoring
             # both from the pre-action snapshot reverses any of them.
@@ -1174,6 +1288,12 @@ def _handle_callback(callback: dict) -> None:
     if action == "puntdue":
         _handle_punt_due(callback_id, chat_id, message_id, payload)
         return
+    if action == "estim":
+        _handle_estimate_pick(callback_id, chat_id, message_id, payload)
+        return
+    if action == "estimdur":
+        _handle_estimate_duration(callback_id, chat_id, message_id, payload)
+        return
     task_id = int(payload)
 
     try:
@@ -1219,7 +1339,7 @@ def _handle_callback(callback: dict) -> None:
                 raise RuntimeError(f'No existe el label "{_TARJETA_LABEL_TITLE}" en Vikunja')
             if not any(l["id"] == label_obj["id"] for l in task.get("labels") or []):
                 _vk_put(f"/tasks/{task_id}/labels", {"label_id": label_obj["id"]})
-            new_title = _zero_out_estimate(task["title"])
+            new_title = _set_estimate(task["title"], 0)
             if new_title != task["title"]:
                 _vk_task_update(task_id, {"title": new_title})
             result_text = f'💳 {new_title} — etiquetada "{_TARJETA_LABEL_TITLE}", estimado a 0'
@@ -1472,6 +1592,25 @@ def _handle_message(message: dict) -> None:
         log.info("Sent /tarjeta task picker (%d task(s)) to chat %s", len(tasks), chat_id)
         return
 
+    if command == "/estimar":
+        try:
+            tasks = _today_tasks()
+        except requests.RequestException as e:
+            log.error("Could not fetch today's tasks: %s", e)
+            _telegram_call("sendMessage", chat_id=chat_id, text=f"Error: {e}")
+            return
+
+        if not tasks:
+            _telegram_call("sendMessage", chat_id=chat_id, text="🎉 No hay tareas pendientes hoy.")
+            return
+
+        _telegram_call(
+            "sendMessage", chat_id=chat_id, text="¿Qué tarea querés estimar?",
+            reply_markup=_task_picker_keyboard(tasks, "estim"),
+        )
+        log.info("Sent /estimar task picker (%d task(s)) to chat %s", len(tasks), chat_id)
+        return
+
     if command in ("/punt", "/postergar"):
         try:
             tasks = _overdue_tasks() + _today_tasks()
@@ -1560,6 +1699,7 @@ def main() -> None:
                 {"command": "borrar", "description": "Borrar una tarea de hoy"},
                 {"command": "tarjeta", "description": 'Etiquetar "Para tarjeta" y poner estimado en 0'},
                 {"command": "punt", "description": "Posponer una tarea vencida o de hoy"},
+                {"command": "estimar", "description": "Poner o cambiar la estimación de una tarea de hoy"},
             ],
         )
     except (requests.RequestException, RuntimeError) as e:
