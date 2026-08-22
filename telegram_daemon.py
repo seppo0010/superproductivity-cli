@@ -52,6 +52,7 @@ WEBHOOK_PORT = int(os.environ.get("VIKUNJA_WEBHOOK_PORT", "8765"))
 
 TELEGRAM_API = "https://api.telegram.org/bot{token}/{method}"
 CHECK_INTERVAL_SECONDS = 300  # safety-net reconciliation cadence
+RESEND_AFTER_SECONDS = 600  # re-post an unacknowledged due notification after this long
 
 STATE_DIR = Path(os.environ.get("SP_CLI_STATE_DIR", Path.home() / ".config" / "sp-cli"))
 NOTIFY_STATE_FILE = STATE_DIR / "notify_state.json"
@@ -591,7 +592,7 @@ def _telegram_call(method: str, **params) -> object:
     return body["result"]
 
 
-def _send_due_notification(task: dict) -> bool:
+def _send_due_notification(task: dict) -> Optional[int]:
     keyboard = {
         "inline_keyboard": [
             [{"text": "✅ Hecha", "callback_data": f"done:{task['id']}"}],
@@ -605,21 +606,45 @@ def _send_due_notification(task: dict) -> bool:
     }
     text = f"⏰ Vencida: {task['title']}\n{_format_due(task)}"
     try:
-        _telegram_call("sendMessage", chat_id=CHAT_ID, text=text, reply_markup=keyboard)
-        return True
+        result = _telegram_call("sendMessage", chat_id=CHAT_ID, text=text, reply_markup=keyboard)
+        return result["message_id"]
     except (requests.RequestException, RuntimeError) as e:
         log.error("Failed to send Telegram notification for task %s: %s", task["id"], e)
-        return False
+        return None
 
 
 # ─── Overdue notification state (shared between webhook + reconciliation) ──
+#
+# `notified` maps str(task_id) -> {"message_id": int, "sent_at": iso str}, so
+# reconciliation can tell how long a due notification has gone unacknowledged
+# (not done, not punted/snoozed) and re-post it after RESEND_AFTER_SECONDS.
 
-def _notify_if_new(task: dict, notified: set) -> None:
-    tid = task["id"]
-    if tid in notified or task.get("done"):
+def _notify_if_new(task: dict, notified: dict) -> None:
+    key = str(task["id"])
+    if key in notified or task.get("done"):
         return
-    if _send_due_notification(task):
-        notified.add(tid)
+    message_id = _send_due_notification(task)
+    if message_id is not None:
+        notified[key] = {"message_id": message_id, "sent_at": datetime.now(timezone.utc).isoformat()}
+
+
+def _resend_if_stale(task: dict, notified: dict) -> None:
+    key = str(task["id"])
+    entry = notified.get(key)
+    if entry is None or task.get("done"):
+        return
+    sent_at = datetime.fromisoformat(entry["sent_at"])
+    if (datetime.now(timezone.utc) - sent_at).total_seconds() < RESEND_AFTER_SECONDS:
+        return
+    try:
+        _telegram_call("deleteMessage", chat_id=CHAT_ID, message_id=entry["message_id"])
+    except (requests.RequestException, RuntimeError) as e:
+        log.warning("Could not delete stale due notification for task %s: %s", task["id"], e)
+    message_id = _send_due_notification(task)
+    if message_id is not None:
+        notified[key] = {"message_id": message_id, "sent_at": datetime.now(timezone.utc).isoformat()}
+    else:
+        del notified[key]
 
 
 # ─── Webhook receiver (background thread, push path) ────────────────────────
@@ -653,11 +678,11 @@ def _handle_webhook_payload(payload: dict) -> None:
         return
 
     with _state_lock:
-        state = _load_json(NOTIFY_STATE_FILE, {"notified_ids": []})
-        notified = set(state.get("notified_ids", []))
+        state = _load_json(NOTIFY_STATE_FILE, {"notified": {}})
+        notified = state.get("notified", {})
         for t in tasks:
             _notify_if_new(t, notified)
-        _save_json(NOTIFY_STATE_FILE, {"notified_ids": sorted(notified)})
+        _save_json(NOTIFY_STATE_FILE, {"notified": notified})
 
 
 class _WebhookHandler(http.server.BaseHTTPRequestHandler):
@@ -720,15 +745,21 @@ def check_due_tasks() -> Optional[int]:
                 next_due_in = seconds
 
     with _state_lock:
-        state = _load_json(NOTIFY_STATE_FILE, {"notified_ids": []})
-        notified = set(state.get("notified_ids", []))
+        state = _load_json(NOTIFY_STATE_FILE, {"notified": {}})
+        notified = state.get("notified", {})
 
-        new_ids = [tid for tid in overdue if tid not in notified]
-        for tid in new_ids:
-            _notify_if_new(overdue[tid], notified)
+        new_ids = [tid for tid in overdue if str(tid) not in notified]
+        for tid, task in overdue.items():
+            if str(tid) in notified:
+                _resend_if_stale(task, notified)
+            else:
+                _notify_if_new(task, notified)
 
-        notified &= overdue.keys()
-        _save_json(NOTIFY_STATE_FILE, {"notified_ids": sorted(notified)})
+        stale_keys = [k for k in notified if int(k) not in overdue]
+        for k in stale_keys:
+            del notified[k]
+
+        _save_json(NOTIFY_STATE_FILE, {"notified": notified})
 
     if new_ids:
         log.info("Reconciliation notified %d newly overdue task(s)", len(new_ids))
