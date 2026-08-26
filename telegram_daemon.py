@@ -359,7 +359,7 @@ def _set_estimate(title: str, minutes: int) -> str:
     return f"{prefix} {rest}" if rest else prefix
 
 
-_ESTIMATE_OPTIONS = [(5, "5m"), (10, "10m"), (15, "15m"), (60, "1h"), (120, "2h")]
+_ESTIMATE_OPTIONS = [(0, "0"), (5, "5m"), (10, "10m"), (15, "15m"), (60, "1h"), (120, "2h")]
 
 
 def _estimate_duration_keyboard(task_id: int) -> dict:
@@ -1147,7 +1147,7 @@ def _handle_estimate_duration(callback_id: str, chat_id, message_id, payload: st
         state[str(task_id)] = {"action": "estimate", "task": task}
         _save_json(UNDO_STATE_FILE, state)
 
-    result_text = f"⏱ {new_title} — estimado en {_format_minutes(minutes)}"
+    result_text = f"⏱ {new_title} — estimado en {'0' if minutes == 0 else _format_minutes(minutes)}"
     try:
         _telegram_call(
             "editMessageText", chat_id=chat_id, message_id=message_id, text=result_text,
