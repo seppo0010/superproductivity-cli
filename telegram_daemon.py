@@ -873,6 +873,18 @@ def _handle_new_task_project(callback_id: str, chat_id, message_id, payload: str
     state[str(chat_id)] = pending
     _save_json(PENDING_TASK_STATE_FILE, state)
 
+    # Set the time-entry state as soon as the due-date keyboard is shown, not
+    # only once "⏰ Elegir hora" is pressed, so a plain "HH:MM" reply works
+    # immediately without touching a button.
+    with _state_lock:
+        time_state = _load_json(PENDING_TIME_STATE_FILE, {})
+        time_state[str(chat_id)] = {
+            "kind": "newtask", "title": pending["title"],
+            "project_id": project_id, "project_title": project_title,
+            "message_id": message_id,
+        }
+        _save_json(PENDING_TIME_STATE_FILE, time_state)
+
     _telegram_call(
         "editMessageText", chat_id=chat_id, message_id=message_id,
         text=f"📝 {pending['title']}\nProyecto: {project_title}\n¿Vencimiento?",
@@ -896,18 +908,30 @@ def _handle_new_task_due(callback_id: str, chat_id, message_id, payload: str) ->
     _save_json(PENDING_TASK_STATE_FILE, state)
 
     if payload == "pick":
-        time_state = _load_json(PENDING_TIME_STATE_FILE, {})
-        time_state[str(chat_id)] = {
-            "kind": "newtask", "title": pending["title"],
-            "project_id": pending["project_id"], "project_title": pending["project_title"],
-        }
-        _save_json(PENDING_TIME_STATE_FILE, time_state)
+        # Already set when the due-date keyboard was shown; re-set here in
+        # case the pending-task state diverged (defensive, same values).
+        with _state_lock:
+            time_state = _load_json(PENDING_TIME_STATE_FILE, {})
+            time_state[str(chat_id)] = {
+                "kind": "newtask", "title": pending["title"],
+                "project_id": pending["project_id"], "project_title": pending["project_title"],
+                "message_id": message_id,
+            }
+            _save_json(PENDING_TIME_STATE_FILE, time_state)
         _telegram_call(
             "editMessageText", chat_id=chat_id, message_id=message_id,
             text=f"📝 {pending['title']}\nProyecto: {pending['project_title']}\n¿A qué hora? (HH:MM)",
         )
         _telegram_call("answerCallbackQuery", callback_query_id=callback_id)
         return
+
+    # A due-date button (not "pick") was pressed instead of a plain-text
+    # time reply — clear the pending time-entry state so a later message
+    # isn't mistaken for a leftover time entry for this already-resolved task.
+    with _state_lock:
+        time_state = _load_json(PENDING_TIME_STATE_FILE, {})
+        time_state.pop(str(chat_id), None)
+        _save_json(PENDING_TIME_STATE_FILE, time_state)
 
     if payload == "today":
         due_date_iso, due_label = _day_to_due_iso(date.today()), "Hoy"
@@ -966,6 +990,16 @@ def _handle_punt_pick(callback_id: str, chat_id, message_id, payload: str) -> No
         )
         return
 
+    # Set the time-entry state as soon as the due-date keyboard is shown, not
+    # only once "⏰ Elegir hora" is pressed, so a plain "HH:MM" reply works
+    # immediately without touching a button.
+    with _state_lock:
+        time_state = _load_json(PENDING_TIME_STATE_FILE, {})
+        time_state[str(chat_id)] = {
+            "kind": "punt", "task_id": task_id, "task_title": task["title"], "message_id": message_id,
+        }
+        _save_json(PENDING_TIME_STATE_FILE, time_state)
+
     _telegram_call(
         "editMessageText", chat_id=chat_id, message_id=message_id,
         text=f"📅 {task['title']}\n¿Nuevo vencimiento?", reply_markup=_punt_due_keyboard(task_id),
@@ -1013,9 +1047,13 @@ def _handle_punt_due(callback_id: str, chat_id, message_id, payload: str) -> Non
         return
 
     if option == "pick":
+        # Already set when the due-date keyboard was shown; re-set here in
+        # case it diverged (defensive, same values).
         with _state_lock:
             time_state = _load_json(PENDING_TIME_STATE_FILE, {})
-            time_state[str(chat_id)] = {"kind": "punt", "task_id": task_id, "task_title": task["title"]}
+            time_state[str(chat_id)] = {
+            "kind": "punt", "task_id": task_id, "task_title": task["title"], "message_id": message_id,
+        }
             _save_json(PENDING_TIME_STATE_FILE, time_state)
         _telegram_call(
             "editMessageText", chat_id=chat_id, message_id=message_id,
@@ -1023,6 +1061,14 @@ def _handle_punt_due(callback_id: str, chat_id, message_id, payload: str) -> Non
         )
         _telegram_call("answerCallbackQuery", callback_query_id=callback_id)
         return
+
+    # A due-date button (not "pick") was pressed instead of a plain-text
+    # time reply — clear the pending time-entry state so a later message
+    # isn't mistaken for a leftover time entry for this already-resolved task.
+    with _state_lock:
+        time_state = _load_json(PENDING_TIME_STATE_FILE, {})
+        time_state.pop(str(chat_id), None)
+        _save_json(PENDING_TIME_STATE_FILE, time_state)
 
     if option == "snooze10":
         due_date_iso = (datetime.now(timezone.utc) + timedelta(minutes=10)).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -1164,13 +1210,27 @@ def _handle_estimate_duration(callback_id: str, chat_id, message_id, payload: st
 _TIME_RE = re.compile(r"^([01]?\d|2[0-3]):([0-5]\d)$")
 
 
+def _reply_to_pending(chat_id, message_id: Optional[int], text: str, reply_markup: Optional[dict] = None) -> None:
+    """Edits the message that showed the due-date keyboard to reflect the
+    typed-in time, falling back to a new message if it can no longer be
+    edited (e.g. too old, or already replaced)."""
+    if message_id is not None:
+        try:
+            _telegram_call(
+                "editMessageText", chat_id=chat_id, message_id=message_id, text=text, reply_markup=reply_markup
+            )
+            return
+        except (requests.RequestException, RuntimeError) as e:
+            log.warning("Could not edit pending message %s, sending new one: %s", message_id, e)
+    _telegram_call("sendMessage", chat_id=chat_id, text=text, reply_markup=reply_markup)
+
+
 def _handle_time_entry(chat_id, text: str, pending: dict) -> None:
+    message_id = pending.get("message_id")
+
     m = _TIME_RE.match(text.strip())
     if not m:
-        _telegram_call(
-            "sendMessage", chat_id=chat_id,
-            text="Formato inválido. Escribí la hora como HH:MM (ej: 14:30).",
-        )
+        _reply_to_pending(chat_id, message_id, "Formato inválido. Escribí la hora como HH:MM (ej: 14:30).")
         return
 
     hour, minute = int(m.group(1)), int(m.group(2))
@@ -1190,11 +1250,11 @@ def _handle_time_entry(chat_id, text: str, pending: dict) -> None:
             )
         except requests.RequestException as e:
             log.error("Could not create task: %s", e)
-            _telegram_call("sendMessage", chat_id=chat_id, text=f"Error: {e}")
+            _reply_to_pending(chat_id, message_id, f"Error: {e}")
             return
-        _telegram_call(
-            "sendMessage", chat_id=chat_id,
-            text=f"✅ Creada: {pending['title']}\nProyecto: {pending['project_title']}\nVencimiento: {due_label}",
+        _reply_to_pending(
+            chat_id, message_id,
+            f"✅ Creada: {pending['title']}\nProyecto: {pending['project_title']}\nVencimiento: {due_label}",
         )
         log.info("Created task '%s' for chat %s", pending["title"], chat_id)
         return
@@ -1205,21 +1265,21 @@ def _handle_time_entry(chat_id, text: str, pending: dict) -> None:
         task = _find_task(task_id)
     except requests.RequestException as e:
         log.error("Could not fetch task %s: %s", task_id, e)
-        _telegram_call("sendMessage", chat_id=chat_id, text=f"Error: {e}")
+        _reply_to_pending(chat_id, message_id, f"Error: {e}")
         return
     if task is None:
-        _telegram_call("sendMessage", chat_id=chat_id, text="Esa tarea ya no existe")
+        _reply_to_pending(chat_id, message_id, "Esa tarea ya no existe")
         return
 
     try:
         result_text = _apply_punt(task, task_id, due_date_iso, due_label)
     except requests.RequestException as e:
         log.error("Could not punt task %s: %s", task_id, e)
-        _telegram_call("sendMessage", chat_id=chat_id, text=f"Error: {e}")
+        _reply_to_pending(chat_id, message_id, f"Error: {e}")
         return
 
-    _telegram_call(
-        "sendMessage", chat_id=chat_id, text=result_text,
+    _reply_to_pending(
+        chat_id, message_id, result_text,
         reply_markup={"inline_keyboard": [[{"text": "↩️ Deshacer", "callback_data": f"undo:{task_id}"}]]},
     )
 
@@ -1307,6 +1367,13 @@ def _handle_callback(callback: dict) -> None:
         _handle_new_task_due(callback_id, chat_id, message_id, payload)
         return
     if action == "hcancel":
+        with _state_lock:
+            time_state = _load_json(PENDING_TIME_STATE_FILE, {})
+            time_state.pop(str(chat_id), None)
+            _save_json(PENDING_TIME_STATE_FILE, time_state)
+            task_state = _load_json(PENDING_TASK_STATE_FILE, {})
+            task_state.pop(str(chat_id), None)
+            _save_json(PENDING_TASK_STATE_FILE, task_state)
         _telegram_call("editMessageText", chat_id=chat_id, message_id=message_id, text="Cancelado")
         _telegram_call("answerCallbackQuery", callback_query_id=callback_id)
         return
