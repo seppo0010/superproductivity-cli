@@ -373,6 +373,29 @@ def _estimate_duration_keyboard(task_id: int) -> dict:
     return {"inline_keyboard": rows + [[{"text": "❌ Cancelar", "callback_data": "hcancel:0"}]]}
 
 
+# Vikunja priority levels: 0 Unset, 1 Low, 2 Medium, 3 High, 4 Urgent, 5 DO NOW.
+_PRIORITY_OPTIONS = [(0, "Ninguna"), (1, "Baja"), (2, "Media"), (3, "Alta"), (4, "Urgente"), (5, "Ya mismo")]
+_PRIORITY_EMOJI = {3: "🔸", 4: "🔺", 5: "🚨"}
+
+
+def _priority_prefix(task: dict) -> str:
+    """A short emoji flag for High/Urgent/DO NOW tasks in list views — Low
+    and Medium aren't distinctive enough to be worth the visual noise."""
+    emoji = _PRIORITY_EMOJI.get(task.get("priority") or 0)
+    return f"{emoji} " if emoji else ""
+
+
+def _priority_keyboard(task_id: int) -> dict:
+    rows = [
+        [
+            {"text": label, "callback_data": f"priolvl:{task_id}:{level}"}
+            for level, label in _PRIORITY_OPTIONS[i:i + 3]
+        ]
+        for i in range(0, len(_PRIORITY_OPTIONS), 3)
+    ]
+    return {"inline_keyboard": rows + [[{"text": "❌ Cancelar", "callback_data": "hcancel:0"}]]}
+
+
 _WEEKDAY_NAMES = {
     "lunes": 0, "martes": 1, "miercoles": 2, "miércoles": 2, "jueves": 3,
     "viernes": 4, "sabado": 5, "sábado": 5, "domingo": 6,
@@ -472,7 +495,7 @@ def _format_day_message(tasks: list, label: str, overdue: Optional[list] = None,
             due_date = _task_local_date(t)
             date_str = due_date.strftime("%Y-%m-%d") if due_date else "──"
             project_title = project_map.get(t.get("project_id"), _INBOX_LABEL)
-            lines.append(f"⚠️ {date_str}  {_task_title_link(t)} · {html.escape(project_title)}{_labels_text(t)}")
+            lines.append(f"⚠️ {date_str}  {_priority_prefix(t)}{_task_title_link(t)} · {html.escape(project_title)}{_labels_text(t)}")
         lines.append("")
 
     if tasks:
@@ -482,7 +505,7 @@ def _format_day_message(tasks: list, label: str, overdue: Optional[list] = None,
             due_dt = _task_due_dt(t)
             time_str = due_dt.astimezone().strftime("%H:%M") if due_dt else "──"
             project_title = project_map.get(t.get("project_id"), _INBOX_LABEL)
-            lines.append(f"🕐 {time_str}  {_task_title_link(t)} · {html.escape(project_title)}{_labels_text(t)}")
+            lines.append(f"🕐 {time_str}  {_priority_prefix(t)}{_task_title_link(t)} · {html.escape(project_title)}{_labels_text(t)}")
 
         estimates = [_parse_estimate_minutes(t["title"]) for t in tasks]
         missing = estimates.count(None)
@@ -537,7 +560,7 @@ def _hecho_button_label(task: dict, project_map: dict) -> str:
     due_dt = _task_due_dt(task)
     time_str = due_dt.astimezone().strftime("%H:%M") if due_dt else "──"
     project_title = project_map.get(task.get("project_id"), _INBOX_LABEL)
-    return f"{time_str} · {project_title} · {task['title']}"
+    return f"{time_str} · {_priority_prefix(task)}{project_title} · {task['title']}"
 
 
 def _task_picker_keyboard(tasks: list, action: str, label_fn=_hecho_button_label) -> dict:
@@ -560,7 +583,7 @@ def _punt_button_label(task: dict, project_map: dict, today: date) -> str:
         due_dt = _task_due_dt(task)
         prefix = due_dt.astimezone().strftime("%H:%M") if due_dt else "──"
     project_title = project_map.get(task.get("project_id"), _INBOX_LABEL)
-    return f"{prefix} · {project_title} · {task['title']}"
+    return f"{prefix} · {_priority_prefix(task)}{project_title} · {task['title']}"
 
 
 def _punt_due_keyboard(task_id: int) -> dict:
@@ -1205,6 +1228,99 @@ def _handle_estimate_duration(callback_id: str, chat_id, message_id, payload: st
     log.info("Set estimate for task %s to %d min", task_id, minutes)
 
 
+# ─── Priority flow (set/change a task's priority) ──────────────────────────
+
+def _handle_priority_pick(callback_id: str, chat_id, message_id, payload: str) -> None:
+    try:
+        task_id = int(payload)
+    except ValueError:
+        _telegram_call(
+            "answerCallbackQuery", callback_query_id=callback_id,
+            text="Opción inválida", show_alert=True,
+        )
+        return
+
+    try:
+        task = _find_task(task_id)
+    except requests.RequestException as e:
+        log.error("Could not fetch task %s: %s", task_id, e)
+        _telegram_call(
+            "answerCallbackQuery", callback_query_id=callback_id,
+            text=f"Error: {e}", show_alert=True,
+        )
+        return
+
+    if task is None:
+        log.warning("Task %s no longer exists", task_id)
+        _telegram_call(
+            "answerCallbackQuery", callback_query_id=callback_id,
+            text="Esa tarea ya no existe", show_alert=True,
+        )
+        return
+
+    _telegram_call(
+        "editMessageText", chat_id=chat_id, message_id=message_id,
+        text=f"🚩 {task['title']}\n¿Qué prioridad le ponemos?",
+        reply_markup=_priority_keyboard(task_id),
+    )
+    _telegram_call("answerCallbackQuery", callback_query_id=callback_id)
+
+
+def _handle_priority_set(callback_id: str, chat_id, message_id, payload: str) -> None:
+    try:
+        task_id_str, level_str = payload.split(":", 1)
+        task_id, level = int(task_id_str), int(level_str)
+    except ValueError:
+        log.warning("Malformed priolvl payload: %s", payload)
+        _telegram_call("answerCallbackQuery", callback_query_id=callback_id)
+        return
+
+    try:
+        task = _find_task(task_id)
+    except requests.RequestException as e:
+        log.error("Could not fetch task %s: %s", task_id, e)
+        _telegram_call(
+            "answerCallbackQuery", callback_query_id=callback_id,
+            text=f"Error: {e}", show_alert=True,
+        )
+        return
+
+    if task is None:
+        log.warning("Task %s no longer exists", task_id)
+        _telegram_call(
+            "answerCallbackQuery", callback_query_id=callback_id,
+            text="Esa tarea ya no existe", show_alert=True,
+        )
+        return
+
+    label = dict(_PRIORITY_OPTIONS)[level]
+    try:
+        _vk_task_update(task_id, {"priority": level})
+    except requests.RequestException as e:
+        log.error("Could not update priority for task %s: %s", task_id, e)
+        _telegram_call(
+            "answerCallbackQuery", callback_query_id=callback_id,
+            text=f"Error: {e}", show_alert=True,
+        )
+        return
+
+    with _state_lock:
+        state = _load_json(UNDO_STATE_FILE, {})
+        state[str(task_id)] = {"action": "priority", "task": task}
+        _save_json(UNDO_STATE_FILE, state)
+
+    result_text = f"🚩 {task['title']} — prioridad: {label}"
+    try:
+        _telegram_call(
+            "editMessageText", chat_id=chat_id, message_id=message_id, text=result_text,
+            reply_markup={"inline_keyboard": [[{"text": "↩️ Deshacer", "callback_data": f"undo:{task_id}"}]]},
+        )
+    except (requests.RequestException, RuntimeError) as e:
+        log.error("Could not edit Telegram message: %s", e)
+    _telegram_call("answerCallbackQuery", callback_query_id=callback_id, text="Prioridad actualizada")
+    log.info("Set priority for task %s to %d", task_id, level)
+
+
 # ─── Time-entry flow (plain "HH:MM" reply after "⏰ Elegir hora") ───────────
 
 _TIME_RE = re.compile(r"^([01]?\d|2[0-3]):([0-5]\d)$")
@@ -1322,6 +1438,9 @@ def _handle_undo(callback_id: str, chat_id, message_id, payload: str) -> None:
         elif entry["action"] == "estimate":
             _vk_task_update(prev_task["id"], {"title": prev_task["title"]})
             result_text = f"↩️ {prev_task['title']} — deshecho"
+        elif entry["action"] == "priority":
+            _vk_task_update(prev_task["id"], {"priority": prev_task.get("priority") or 0})
+            result_text = f"↩️ {prev_task['title']} — deshecho"
         else:
             # done/snooze* only ever touch these two fields, so restoring
             # both from the pre-action snapshot reverses any of them.
@@ -1391,6 +1510,12 @@ def _handle_callback(callback: dict) -> None:
         return
     if action == "estimdur":
         _handle_estimate_duration(callback_id, chat_id, message_id, payload)
+        return
+    if action == "prio":
+        _handle_priority_pick(callback_id, chat_id, message_id, payload)
+        return
+    if action == "priolvl":
+        _handle_priority_set(callback_id, chat_id, message_id, payload)
         return
     task_id = int(payload)
 
@@ -1709,6 +1834,25 @@ def _handle_message(message: dict) -> None:
         log.info("Sent /estimar task picker (%d task(s)) to chat %s", len(tasks), chat_id)
         return
 
+    if command == "/prioridad":
+        try:
+            tasks = _today_tasks()
+        except requests.RequestException as e:
+            log.error("Could not fetch today's tasks: %s", e)
+            _telegram_call("sendMessage", chat_id=chat_id, text=f"Error: {e}")
+            return
+
+        if not tasks:
+            _telegram_call("sendMessage", chat_id=chat_id, text="🎉 No hay tareas pendientes hoy.")
+            return
+
+        _telegram_call(
+            "sendMessage", chat_id=chat_id, text="¿A qué tarea le cambiamos la prioridad?",
+            reply_markup=_task_picker_keyboard(tasks, "prio"),
+        )
+        log.info("Sent /prioridad task picker (%d task(s)) to chat %s", len(tasks), chat_id)
+        return
+
     if command in ("/punt", "/postergar"):
         try:
             tasks = _overdue_tasks() + _today_tasks()
@@ -1798,6 +1942,7 @@ def main() -> None:
                 {"command": "tarjeta", "description": 'Etiquetar "Para tarjeta" y poner estimado en 0'},
                 {"command": "punt", "description": "Posponer una tarea vencida o de hoy"},
                 {"command": "estimar", "description": "Poner o cambiar la estimación de una tarea de hoy"},
+                {"command": "prioridad", "description": "Poner o cambiar la prioridad de una tarea de hoy"},
             ],
         )
     except (requests.RequestException, RuntimeError) as e:

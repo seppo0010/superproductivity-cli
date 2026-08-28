@@ -207,6 +207,42 @@ def _project_rich_name(task: dict, all_projects: list) -> str:
     return _project_rich_label(proj) if proj else "?"
 
 
+_PRIORITY_NAMES = {
+    "unset": 0,
+    "low": 1,
+    "medium": 2,
+    "high": 3,
+    "urgent": 4,
+    "donow": 5,
+}
+_PRIORITY_LABELS = {
+    1: "[dim]Low[/dim]",
+    2: "Medium",
+    3: "[yellow]High[/yellow]",
+    4: "[red]Urgent[/red]",
+    5: "[bold red]DO NOW[/bold red]",
+}
+
+
+def _parse_priority(value: str) -> int:
+    """Accept a Vikunja priority by name (low/medium/high/urgent/donow/unset)
+    or by its numeric value (0-5)."""
+    if value.isdigit() and 0 <= int(value) <= 5:
+        return int(value)
+    key = value.strip().lower().replace(" ", "").replace("-", "").replace("_", "")
+    if key in _PRIORITY_NAMES:
+        return _PRIORITY_NAMES[key]
+    console.print(
+        f"[red]Invalid priority '[bold]{value}[/bold]'. "
+        "Use unset, low, medium, high, urgent, donow, or 0-5.[/red]"
+    )
+    raise typer.Exit(1)
+
+
+def _priority_label(task: dict) -> str:
+    return _PRIORITY_LABELS.get(task.get("priority") or 0, "")
+
+
 def _parse_due(value: str) -> str:
     """Resolve 'today', 'tomorrow', or passthrough a YYYY-MM-DD string."""
     if value == "today":
@@ -425,6 +461,9 @@ def add(
     ),
     notes: Optional[str] = typer.Option(None, "--notes", "-n", help="Task description"),
     due: Optional[str] = typer.Option(None, "--due", "-d", help="Due date (today, tomorrow, or YYYY-MM-DD)"),
+    priority: Optional[str] = typer.Option(
+        None, "--priority", "-P", help="Priority: unset, low, medium, high, urgent, donow, or 0-5"
+    ),
 ):
     """Create a new task.
 
@@ -446,6 +485,8 @@ def add(
         body["description"] = notes
     if due:
         body["due_date"] = _due_value_to_iso(due)
+    if priority:
+        body["priority"] = _parse_priority(priority)
 
     result: dict = _put(f"/projects/{project_id}/tasks", body)
 
@@ -482,6 +523,9 @@ def edit(
     notes: Optional[str] = typer.Option(None, "--notes", "-n", help="New description"),
     due: Optional[str] = typer.Option(None, "--due", "-d", help="Due date (today, tomorrow, or YYYY-MM-DD)"),
     project: Optional[str] = typer.Option(None, "--project", "-p", help="Move to project (name substring)"),
+    priority: Optional[str] = typer.Option(
+        None, "--priority", "-P", help="Priority: unset, low, medium, high, urgent, donow, or 0-5"
+    ),
 ):
     """Edit an existing task."""
     task = _resolve_task(query)
@@ -496,9 +540,11 @@ def edit(
     if project:
         all_projects: list = _get("/projects")
         changes["project_id"] = _match_project(project, all_projects)
+    if priority:
+        changes["priority"] = _parse_priority(priority)
 
     if not changes:
-        console.print("[yellow]Nothing to update. Use --title, --notes, --due, or --project.[/yellow]")
+        console.print("[yellow]Nothing to update. Use --title, --notes, --due, --project, or --priority.[/yellow]")
         raise typer.Exit(0)
 
     _task_update(task["id"], changes)
@@ -577,6 +623,7 @@ def list_tasks(
     project_cells = [_project_rich_name(t, all_projects) for t in tasks]
     labels_cells = [_labels_rich_text(t) for t in tasks]
     due_cells = [_format_due(t) for t in tasks]
+    priority_cells = [_priority_label(t) for t in tasks]
     recurring_cells = ["[blue]↻[/blue]" if t.get("repeat_after") else "" for t in tasks]
     done_cells = ["[green]✓[/green]" if t.get("done") else "" for t in tasks]
 
@@ -586,12 +633,13 @@ def list_tasks(
     w_project = _col_w("Project", project_cells)
     w_labels = _col_w("Labels", labels_cells)
     w_due = _col_w("Due", due_cells)
+    w_priority = _col_w("Priority", priority_cells)
     w_recurring = 1
     w_done = 1
 
-    num_columns = 6
+    num_columns = 7
     overhead = 3 * num_columns + 1  # empirical: per-column padding + table margins
-    other_width = w_project + w_labels + w_due + w_recurring + w_done
+    other_width = w_project + w_labels + w_due + w_priority + w_recurring + w_done
     # Below MIN_TABLE_WIDTH there isn't enough room to lay out all columns
     # sensibly; render at MIN_TABLE_WIDTH instead and let the terminal soft-wrap.
     render_width = max(console.size.width, MIN_TABLE_WIDTH)
@@ -603,6 +651,7 @@ def list_tasks(
     table.add_column("Project", width=w_project)
     table.add_column("Labels", width=w_labels)
     table.add_column("Due", style="yellow", width=w_due, no_wrap=True)
+    table.add_column("Priority", width=w_priority, no_wrap=True)
     table.add_column("", width=w_recurring, justify="center", no_wrap=True)
     table.add_column("", width=w_done, justify="center")
 
@@ -612,6 +661,7 @@ def list_tasks(
             project_cells[i],
             labels_cells[i],
             due_cells[i],
+            priority_cells[i],
             recurring_cells[i],
             done_cells[i],
             style="dim" if t.get("done") else "",
