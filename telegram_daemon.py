@@ -729,6 +729,8 @@ def _load_heat_emoji(total: int, free_minutes: Optional[int]) -> str:
     time (window minus calendar events) the estimated task load fills."""
     if free_minutes is None:
         return "⬜"
+    if total <= 0:
+        return "🟩"
     if free_minutes <= 0:
         return "🟥"
     ratio = total / free_minutes
