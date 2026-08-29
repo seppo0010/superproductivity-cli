@@ -591,6 +591,40 @@ def _free_windows_for(day: date, events: list) -> tuple:
     return (free, free_minutes, elapsed)
 
 
+def _task_in_availability_window(task: dict, window: Optional[tuple]) -> bool:
+    """Whether the task's due time falls within the day's availability
+    window. Date-only tasks (the 23:59 "sin hora" sentinel, or any task
+    with no explicit due time) always count as inside — there's no
+    specific time to judge them against, and they're the default case an
+    availability window is meant to cover. A task with an explicit due
+    time outside the window doesn't compete for that window's free time,
+    so it's tracked separately."""
+    if window is None:
+        return True
+    due_dt = _task_due_dt(task)
+    if due_dt is None:
+        return True
+    t = due_dt.astimezone().time()
+    return window[0] <= t <= window[1]
+
+
+def _split_estimates_by_window(tasks: list, window: Optional[tuple]) -> tuple:
+    """Splits tasks' estimated minutes into (inside, outside, missing)
+    buckets against the day's availability window — see
+    _task_in_availability_window. `missing` counts tasks with no
+    estimate at all."""
+    inside = outside = missing = 0
+    for t in tasks:
+        e = _parse_estimate_minutes(t["title"])
+        if e is None:
+            missing += 1
+        elif _task_in_availability_window(t, window):
+            inside += e
+        else:
+            outside += e
+    return inside, outside, missing
+
+
 def _labels_text(task: dict) -> str:
     titles = [l["title"] for l in (task.get("labels") or [])]
     return f" · 🏷 {html.escape(', '.join(titles))}" if titles else ""
@@ -668,19 +702,20 @@ def _format_day_message(
             lines.append(line)
 
         if tasks:
-            estimates = [_parse_estimate_minutes(t["title"]) for t in tasks]
-            missing = estimates.count(None)
-            total = sum(e for e in estimates if e is not None)
+            window = _availability_window_for(day) if day is not None else None
+            inside_total, outside_total, missing = _split_estimates_by_window(tasks, window)
             lines.append("")
             if free_minutes is None:
-                lines.append(f"⏱ Total estimado: {_format_minutes(total)}")
+                lines.append(f"⏱ Total estimado: {_format_minutes(inside_total + outside_total)}")
             else:
                 elapsed_note = " ⏳ desde ahora" if elapsed else ""
                 lines.append(
-                    f"⏱ Total estimado: {_format_minutes(total)} (disponible: {_format_minutes(free_minutes)}{elapsed_note})"
+                    f"⏱ Total estimado: {_format_minutes(inside_total)} (disponible: {_format_minutes(free_minutes)}{elapsed_note})"
                 )
-                if total > free_minutes:
-                    lines.append(f"🚨 Te pasaste por {_format_minutes(total - free_minutes)}")
+                if inside_total > free_minutes:
+                    lines.append(f"🚨 Te pasaste por {_format_minutes(inside_total - free_minutes)}")
+                if outside_total:
+                    lines.append(f"🌙 {_format_minutes(outside_total)} fuera del horario de disponibilidad")
             if missing:
                 lines.append(f"⚠️ {missing} tarea(s) sin estimación")
     elif overdue:
@@ -725,18 +760,19 @@ def _format_load_message(by_date: dict, start: date, days: int, events_by_date: 
             lines.append(f"{heat} {day_label}: sin tareas")
             continue
 
-        estimates = [_parse_estimate_minutes(t["title"]) for t in day_tasks]
-        missing = estimates.count(None)
-        total = sum(e for e in estimates if e is not None)
-        heat = _load_heat_emoji(total, free_minutes)
+        window = _availability_window_for(day)
+        inside_total, outside_total, missing = _split_estimates_by_window(day_tasks, window)
+        heat = _load_heat_emoji(inside_total, free_minutes)
 
-        summary = _format_minutes(total)
+        summary = _format_minutes(inside_total)
         if free_minutes is not None:
             summary += f" / {_format_minutes(free_minutes)}"
             if elapsed:
                 summary += " ⏳"
-            if total > free_minutes:
-                summary += f" 🚨 +{_format_minutes(total - free_minutes)}"
+            if inside_total > free_minutes:
+                summary += f" 🚨 +{_format_minutes(inside_total - free_minutes)}"
+        if outside_total:
+            summary += f" (+{_format_minutes(outside_total)} fuera)"
         if missing:
             summary += f" ⚠️{missing}"
         lines.append(f"{heat} {day_label}: {summary}")
