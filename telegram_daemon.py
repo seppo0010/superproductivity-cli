@@ -909,6 +909,10 @@ def _calendar_events_by_date(start: date, days: int) -> dict:
 # ─── Telegram API ───────────────────────────────────────────────────────────
 
 def _telegram_call(method: str, **params) -> object:
+    # Telegram's API rejects some optional fields (e.g. reply_markup) sent as
+    # JSON null with a 400 — callers that pass through a possibly-None value
+    # (like _reply_to_pending) must have that treated as "omitted".
+    params = {k: v for k, v in params.items() if v is not None}
     url = TELEGRAM_API.format(token=TOKEN, method=method)
     r = requests.post(url, json=params, timeout=35)
     r.raise_for_status()
