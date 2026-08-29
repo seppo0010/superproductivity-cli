@@ -607,6 +607,9 @@ def _format_day_message(
 ) -> str:
     overdue = overdue or []
     events = events or []
+    if day == date.today():
+        now = datetime.now()
+        events = [e for e in events if e["all_day"] or e["end"] > now]
     if not tasks and not overdue and not events:
         return f"🎉 No hay tareas para {label}."
 
