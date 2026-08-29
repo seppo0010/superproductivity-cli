@@ -795,33 +795,37 @@ _ics_cache_lock = threading.Lock()
 
 
 def _calendar_urls() -> list:
-    return _load_json(GOOGLE_CALENDAR_STATE_FILE, {"urls": [], "email": None}).get("urls", [])
+    return _load_json(GOOGLE_CALENDAR_STATE_FILE, {"urls": [], "emails": []}).get("urls", [])
 
 
-def _calendar_email() -> str:
-    """The Google account email used to find "your own" ATTENDEE entry on
-    an event, so declined invites (RSVP) can be filtered out. Empty if not
-    configured — in that case nothing gets filtered on RSVP status."""
-    return _load_json(GOOGLE_CALENDAR_STATE_FILE, {"urls": [], "email": None}).get("email") or ""
+def _calendar_emails() -> list:
+    """Your own email address(es), used to find "your own" ATTENDEE entry
+    on an event so declined invites (RSVP) can be filtered out. Not tied to
+    a particular calendar — a feed that doesn't list one of these as an
+    attendee simply won't match, so it's safe to check all of them against
+    every configured calendar. Only relevant if you attend meetings under
+    more than one address (e.g. a personal Gmail plus a work account);
+    empty means nothing gets filtered on RSVP status."""
+    return _load_json(GOOGLE_CALENDAR_STATE_FILE, {"urls": [], "emails": []}).get("emails", [])
 
 
-def _declined_by(component, email: str) -> bool:
-    """True if `email` is an ATTENDEE on this event with PARTSTAT=DECLINED.
-    Google's private iCal feed still includes events you've declined, so
-    this is the only way to filter them back out."""
-    if not email:
+def _declined_by(component, emails: list) -> bool:
+    """True if any of `emails` is an ATTENDEE on this event with
+    PARTSTAT=DECLINED. Google's private iCal feed still includes events
+    you've declined, so this is the only way to filter them back out."""
+    if not emails:
         return False
     attendees = component.get("attendee")
     if attendees is None:
         return False
     if not isinstance(attendees, list):
         attendees = [attendees]
-    email_lower = email.strip().lower()
+    emails_lower = {e.strip().lower() for e in emails}
     for att in attendees:
         addr = str(att).lower()
         if addr.startswith("mailto:"):
             addr = addr[len("mailto:"):]
-        if addr == email_lower and str(att.params.get("PARTSTAT", "")).upper() == "DECLINED":
+        if addr in emails_lower and str(att.params.get("PARTSTAT", "")).upper() == "DECLINED":
             return True
     return False
 
@@ -856,7 +860,7 @@ def _calendar_events_for_range(start: date, end: date) -> list:
     (and logs) any calendar whose feed can't be fetched/parsed rather than
     failing the whole call."""
     events = []
-    email = _calendar_email()
+    emails = _calendar_emails()
     for url in _calendar_urls():
         try:
             cal = _fetch_calendar(url)
@@ -865,7 +869,7 @@ def _calendar_events_for_range(start: date, end: date) -> list:
             log.warning("Could not fetch/parse calendar %s: %s", url, e)
             continue
         for component in occurrences:
-            if _declined_by(component, email):
+            if _declined_by(component, emails):
                 continue
             dtstart = component.get("dtstart").dt
             dtend_prop = component.get("dtend")
@@ -2003,65 +2007,50 @@ def _handle_message(message: dict) -> None:
 
     if command in ("/calendario", "/cal"):
         urls = _calendar_urls()
+        emails = _calendar_emails()
         args = arg.split(maxsplit=1) if arg else []
 
+        calendario_help = (
+            "Calendarios — /calendario agregar &lt;url-ics&gt; (la dirección secreta en formato iCal: "
+            "Google Calendar → Configuración del calendario → Integrar calendario) · "
+            "/calendario borrar &lt;número&gt;.\n"
+            "Emails para RSVP — /calendario email agregar &lt;dirección&gt; · "
+            "/calendario email borrar &lt;número&gt; (detectan eventos que rechazaste, en cualquiera "
+            "de tus calendarios; solo hace falta más de uno si asistís con más de una identidad).\n"
+            "/calendario actualizar fuerza releer los feeds ahora."
+        )
+
         if not args:
-            if not urls:
-                _telegram_call(
-                    "sendMessage", chat_id=chat_id,
-                    text=(
-                        "No hay calendarios configurados.\n\n"
-                        "Usá /calendario agregar &lt;url-ics&gt; (la dirección secreta en formato iCal: "
-                        "Google Calendar → Configuración del calendario → Integrar calendario), "
-                        "/calendario borrar &lt;número&gt;, o /calendario actualizar para forzar releer los feeds."
-                    ),
-                    parse_mode="HTML",
-                )
-                return
-            email = _calendar_email()
             lines = ["<b>Calendarios configurados</b>", ""]
-            for i, u in enumerate(urls, 1):
-                lines.append(f"{i}. {html.escape(u)}")
+            if urls:
+                for i, u in enumerate(urls, 1):
+                    lines.append(f"{i}. {html.escape(u)}")
+            else:
+                lines.append("(ninguno)")
             lines.append("")
-            lines.append(
-                f"Email para RSVP: {html.escape(email)}" if email
-                else "Email para RSVP: (sin configurar — /calendario email &lt;dirección&gt;, "
-                     "así los eventos que rechazaste no aparecen)"
-            )
+            lines.append("<b>Emails para RSVP</b>")
+            if emails:
+                for i, e in enumerate(emails, 1):
+                    lines.append(f"{i}. {html.escape(e)}")
+            else:
+                lines.append("(ninguno)")
+            lines.append("")
+            lines.append(calendario_help)
             _telegram_call("sendMessage", chat_id=chat_id, text="\n".join(lines), parse_mode="HTML")
             return
 
         if args[0] == "agregar":
             if len(args) < 2 or not args[1].strip():
-                _telegram_call(
-                    "sendMessage", chat_id=chat_id,
-                    text="Usá /calendario agregar <url-ics>.",
-                )
+                _telegram_call("sendMessage", chat_id=chat_id, text="Usá /calendario agregar <url-ics>.")
                 return
             url = args[1].strip()
             with _state_lock:
-                config = _load_json(GOOGLE_CALENDAR_STATE_FILE, {"urls": [], "email": None})
+                config = _load_json(GOOGLE_CALENDAR_STATE_FILE, {"urls": [], "emails": []})
                 if url not in config["urls"]:
                     config["urls"].append(url)
                     _save_json(GOOGLE_CALENDAR_STATE_FILE, config)
             _telegram_call("sendMessage", chat_id=chat_id, text="✓ Calendario agregado.")
             log.info("Added calendar for chat %s", chat_id)
-            return
-
-        if args[0] == "email":
-            if len(args) < 2 or "@" not in args[1]:
-                _telegram_call(
-                    "sendMessage", chat_id=chat_id,
-                    text="Usá /calendario email <dirección>. Es la que usás en Google Calendar, para detectar tus eventos rechazados (RSVP).",
-                )
-                return
-            email = args[1].strip()
-            with _state_lock:
-                config = _load_json(GOOGLE_CALENDAR_STATE_FILE, {"urls": [], "email": None})
-                config["email"] = email
-                _save_json(GOOGLE_CALENDAR_STATE_FILE, config)
-            _telegram_call("sendMessage", chat_id=chat_id, text=f"✓ Email para RSVP: {html.escape(email)}", parse_mode="HTML")
-            log.info("Set calendar RSVP email for chat %s", chat_id)
             return
 
         if args[0] == "borrar":
@@ -2082,12 +2071,69 @@ def _handle_message(message: dict) -> None:
                 )
                 return
             with _state_lock:
-                config = _load_json(GOOGLE_CALENDAR_STATE_FILE, {"urls": [], "email": None})
+                config = _load_json(GOOGLE_CALENDAR_STATE_FILE, {"urls": [], "emails": []})
                 if 0 <= idx < len(config["urls"]):
                     config["urls"].pop(idx)
                     _save_json(GOOGLE_CALENDAR_STATE_FILE, config)
             _telegram_call("sendMessage", chat_id=chat_id, text="✓ Calendario eliminado.")
             log.info("Removed calendar %d for chat %s", idx, chat_id)
+            return
+
+        if args[0] == "email":
+            # Same agregar/borrar-by-index interface as the top-level
+            # calendar commands above, just scoped to this second
+            # collection. Emails are shared across all calendars, not
+            # per-calendar: only relevant if you attend meetings under
+            # more than one identity (e.g. a personal Gmail plus a work
+            # account) — an address that never shows up as an ATTENDEE
+            # just won't match, in any feed.
+            sub = args[1].split(maxsplit=1) if len(args) > 1 else []
+
+            if sub and sub[0] == "agregar":
+                if len(sub) < 2 or "@" not in sub[1]:
+                    _telegram_call("sendMessage", chat_id=chat_id, text="Usá /calendario email agregar <dirección>.")
+                    return
+                email = sub[1].strip()
+                with _state_lock:
+                    config = _load_json(GOOGLE_CALENDAR_STATE_FILE, {"urls": [], "emails": []})
+                    config_emails = config.setdefault("emails", [])
+                    if email.lower() not in {e.lower() for e in config_emails}:
+                        config_emails.append(email)
+                        _save_json(GOOGLE_CALENDAR_STATE_FILE, config)
+                _telegram_call("sendMessage", chat_id=chat_id, text="✓ Email agregado.")
+                log.info("Added calendar RSVP email for chat %s", chat_id)
+                return
+
+            if sub and sub[0] == "borrar":
+                if len(sub) < 2:
+                    _telegram_call(
+                        "sendMessage", chat_id=chat_id,
+                        text="Usá /calendario email borrar <número> (ver /calendario para la lista).",
+                    )
+                    return
+                try:
+                    idx = int(sub[1].strip()) - 1
+                except ValueError:
+                    idx = -1
+                if idx < 0 or idx >= len(emails):
+                    _telegram_call(
+                        "sendMessage", chat_id=chat_id,
+                        text="No entendí el número. Usá /calendario para ver la lista.",
+                    )
+                    return
+                with _state_lock:
+                    config = _load_json(GOOGLE_CALENDAR_STATE_FILE, {"urls": [], "emails": []})
+                    if 0 <= idx < len(config.get("emails", [])):
+                        config["emails"].pop(idx)
+                        _save_json(GOOGLE_CALENDAR_STATE_FILE, config)
+                _telegram_call("sendMessage", chat_id=chat_id, text="✓ Email eliminado.")
+                log.info("Removed calendar RSVP email %d for chat %s", idx, chat_id)
+                return
+
+            _telegram_call(
+                "sendMessage", chat_id=chat_id,
+                text="Usá /calendario email agregar <dirección> o /calendario email borrar <número>.",
+            )
             return
 
         if args[0] == "actualizar":
@@ -2096,10 +2142,7 @@ def _handle_message(message: dict) -> None:
             log.info("Flushed calendar ICS cache for chat %s", chat_id)
             return
 
-        _telegram_call(
-            "sendMessage", chat_id=chat_id,
-            text="Usá /calendario, /calendario agregar <url-ics>, /calendario borrar <número>, /calendario email <dirección>, o /calendario actualizar.",
-        )
+        _telegram_call("sendMessage", chat_id=chat_id, text=calendario_help, parse_mode="HTML")
         return
 
     if command in ("/disponibilidad", "/disp"):
