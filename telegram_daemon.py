@@ -22,6 +22,14 @@ Prerequisites:
     http://<this-host>:VIKUNJA_WEBHOOK_PORT/webhook, events task.overdue
     and tasks.overdue
   • TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID set in the environment
+
+Google Calendar (optional): add a calendar's secret iCal address (Google
+Calendar → calendar settings → "Integrate calendar" → "Secret address in
+iCal format") via the /calendario agregar <url> bot command — no env var
+needed. Events count toward the day's occupancy window unless marked Free
+(the Busy/Free toggle on the event) or all-day. Fetched feeds are cached
+in memory for GOOGLE_CALENDAR_CACHE_SECONDS (default 24h, since calendars
+don't change often); /calendario actualizar flushes that cache on demand.
 """
 
 from __future__ import annotations
@@ -37,10 +45,12 @@ import re
 import sys
 import threading
 import time
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, datetime, time as dtime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
 
+import icalendar
+import recurring_ical_events
 import requests
 
 VIKUNJA_URL = os.environ.get("VIKUNJA_URL", "http://192.168.0.9:3456").rstrip("/")
@@ -62,6 +72,8 @@ PENDING_TASK_STATE_FILE = STATE_DIR / "pending_task_state.json"
 PENDING_TIME_STATE_FILE = STATE_DIR / "pending_time_state.json"
 UNDO_STATE_FILE = STATE_DIR / "undo_state.json"
 AVAILABILITY_STATE_FILE = STATE_DIR / "availability.json"
+GOOGLE_CALENDAR_STATE_FILE = STATE_DIR / "calendars.json"
+GOOGLE_CALENDAR_CACHE_SECONDS = int(os.environ.get("GOOGLE_CALENDAR_CACHE_SECONDS", str(24 * 60 * 60)))
 DAILY_DIGEST_HOUR = 6
 
 TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
@@ -253,8 +265,9 @@ def _tasks_by_date(start: date, days: int) -> dict:
 
 
 def _parse_day_arg(arg: str) -> Optional[date]:
-    """Parse a /day argument: 'hoy'/'today', 'mañana'/'manana'/'tomorrow', or
-    an explicit YYYY-MM-DD. None if unparseable."""
+    """Parse a /day argument: 'hoy'/'today', 'mañana'/'manana'/'tomorrow',
+    an explicit YYYY-MM-DD, or the shorthand DD/MM (current year). None if
+    unparseable."""
     arg = arg.strip().lower()
     if arg in ("hoy", "today"):
         return date.today()
@@ -263,7 +276,15 @@ def _parse_day_arg(arg: str) -> Optional[date]:
     try:
         return datetime.strptime(arg, "%Y-%m-%d").date()
     except ValueError:
-        return None
+        pass
+    m = re.fullmatch(r"(\d{1,2})/(\d{1,2})", arg)
+    if m:
+        day, month = int(m.group(1)), int(m.group(2))
+        try:
+            return date(date.today().year, month, day)
+        except ValueError:
+            return None
+    return None
 
 
 def _today_tasks() -> list:
@@ -404,24 +425,32 @@ _WEEKDAY_DISPLAY = ["Lunes", "Martes", "Miércoles", "Jueves", "Viernes", "Sába
 _WEEKDAY_SHORT = ["Lun", "Mar", "Mié", "Jue", "Vie", "Sáb", "Dom"]
 
 
-def _parse_duration_minutes(s: str) -> Optional[int]:
-    """Parse a duration like '3h', '7h30m', '0', or a bare number (hours)."""
-    s = s.strip().lower()
-    if not s:
+def _parse_time_range(s: str) -> Optional[tuple]:
+    """Parse 'HH:MM-HH:MM' into (dtime, dtime), or None."""
+    m = re.fullmatch(r"(\d{1,2}):(\d{2})-(\d{1,2}):(\d{2})", s.strip())
+    if not m:
         return None
-    if s == "0":
-        return 0
-    hm = re.fullmatch(r"(?:(\d+)h)?(?:(\d+)m)?", s)
-    if hm and (hm.group(1) or hm.group(2)):
-        return int(hm.group(1) or 0) * 60 + int(hm.group(2) or 0)
-    if re.fullmatch(r"\d+(\.\d+)?", s):
-        return round(float(s) * 60)
-    return None
+    h1, m1, h2, m2 = (int(g) for g in m.groups())
+    try:
+        start, end = dtime(h1, m1), dtime(h2, m2)
+    except ValueError:
+        return None
+    if end <= start:
+        return None
+    return (start, end)
+
+
+def _format_time_range(window: tuple) -> str:
+    start, end = window
+    return f"{start.strftime('%H:%M')}–{end.strftime('%H:%M')}"
 
 
 def _parse_availability_target(s: str) -> Optional[tuple]:
-    """Returns ('weekday', '1') or ('date', '2026-08-21'), or None."""
+    """Returns ('weekday', '1'), ('date', '2026-08-21'), or ('general',
+    'general'), or None."""
     s = s.strip().lower()
+    if s == "general":
+        return ("general", "general")
     if s in _WEEKDAY_NAMES:
         return ("weekday", str(_WEEKDAY_NAMES[s]))
     try:
@@ -431,27 +460,57 @@ def _parse_availability_target(s: str) -> Optional[tuple]:
         return None
 
 
-def _availability_minutes_for(day: date) -> Optional[int]:
-    """A specific date overrides the weekday default. None means no limit
-    has been configured for that day."""
-    config = _load_json(AVAILABILITY_STATE_FILE, {"weekday": {}, "date": {}})
+def _parse_stored_window(value) -> Optional[tuple]:
+    """Stored windows are [\"HH:MM\", \"HH:MM\"]. Older state (from before
+    availability switched from a total-minutes-per-day int to a window) is
+    tolerated as unset rather than raising, so a leftover legacy entry can't
+    crash the bot."""
+    try:
+        return tuple(dtime.fromisoformat(t) for t in value)
+    except (TypeError, ValueError):
+        log.warning("Ignoring unparseable availability window: %r", value)
+        return None
+
+
+def _availability_window_for(day: date) -> Optional[tuple]:
+    """A specific date overrides the weekday default, which overrides the
+    general default. None means no window has been configured for that
+    day at any level."""
+    config = _load_json(AVAILABILITY_STATE_FILE, {"weekday": {}, "date": {}, "general": None})
     date_key = day.strftime("%Y-%m-%d")
     if date_key in config.get("date", {}):
-        return config["date"][date_key]
+        window = _parse_stored_window(config["date"][date_key])
+        if window is not None:
+            return window
     weekday_key = str(day.weekday())
     if weekday_key in config.get("weekday", {}):
-        return config["weekday"][weekday_key]
+        window = _parse_stored_window(config["weekday"][weekday_key])
+        if window is not None:
+            return window
+    general = config.get("general")
+    if general:
+        window = _parse_stored_window(general)
+        if window is not None:
+            return window
     return None
 
 
 def _format_availability_config() -> str:
-    config = _load_json(AVAILABILITY_STATE_FILE, {"weekday": {}, "date": {}})
+    config = _load_json(AVAILABILITY_STATE_FILE, {"weekday": {}, "date": {}, "general": None})
     lines = ["<b>Disponibilidad configurada</b>", ""]
+
+    def _window_text(stored) -> str:
+        window = _parse_stored_window(stored)
+        return _format_time_range(window) if window is not None else "(sin parsear, volvé a configurarlo)"
+
+    general = config.get("general")
+    lines.append(f"General: {_window_text(general)}" if general else "General: (sin default configurado)")
+    lines.append("")
 
     weekday_cfg = config.get("weekday", {})
     if weekday_cfg:
         for idx in sorted(weekday_cfg, key=int):
-            lines.append(f"{_WEEKDAY_DISPLAY[int(idx)]}: {_format_minutes(weekday_cfg[idx])}")
+            lines.append(f"{_WEEKDAY_DISPLAY[int(idx)]}: {_window_text(weekday_cfg[idx])}")
     else:
         lines.append("(sin días de semana configurados)")
 
@@ -459,15 +518,77 @@ def _format_availability_config() -> str:
     if date_cfg:
         lines.append("")
         for d in sorted(date_cfg):
-            lines.append(f"{d}: {_format_minutes(date_cfg[d])}")
+            lines.append(f"{d}: {_window_text(date_cfg[d])}")
 
     lines.append("")
     lines.append(
-        "Usá /disponibilidad &lt;día|fecha&gt; &lt;horas&gt; para configurar "
-        "(ej: <code>/disponibilidad martes 3h</code>, <code>/disponibilidad 2026-08-21 7h</code>), "
-        "o /disponibilidad borrar &lt;día|fecha&gt; para quitar."
+        "Usá /disponibilidad &lt;general|día|fecha&gt; &lt;HH:MM-HH:MM&gt; para configurar "
+        "(ej: <code>/disponibilidad general 09:00-18:00</code>, <code>/disponibilidad martes 09:00-13:00</code>, "
+        "<code>/disponibilidad 2026-08-21 10:00-16:00</code>), "
+        "o /disponibilidad borrar &lt;general|día|fecha&gt; para quitar."
     )
     return "\n".join(lines)
+
+
+def _merge_intervals(intervals: list) -> list:
+    """Sorts and merges overlapping (start, end) datetime intervals, so
+    overlapping calendar events don't get double-subtracted from a day's
+    free time."""
+    merged: list = []
+    for start, end in sorted(intervals):
+        if merged and start <= merged[-1][1]:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], end))
+        else:
+            merged.append((start, end))
+    return merged
+
+
+def _free_windows_for(day: date, events: list) -> tuple:
+    """Free (start, end) clock-time gaps within `day`'s configured occupancy
+    window after subtracting Busy, non-all-day calendar events (merging any
+    overlaps). Returns (None, None, False) if no window is configured for
+    the day. For today, the window is clamped to start at the current time
+    — time that's already elapsed isn't free (and if the window's already
+    over, there's simply nothing free left); the third element is True
+    whenever that clamping actually cut into the window, so callers can
+    flag that the free-time figure isn't the full configured window."""
+    window = _availability_window_for(day)
+    if window is None:
+        return (None, None, False)
+    win_start = datetime.combine(day, window[0])
+    win_end = datetime.combine(day, window[1])
+    elapsed = False
+    if day == date.today():
+        now = datetime.now()
+        if now > win_start:
+            win_start = now
+            elapsed = True
+    if win_start >= win_end:
+        return ([], 0, elapsed)
+
+    busy = []
+    for e in events:
+        if e["all_day"] or not e["busy"]:
+            continue
+        s, en = e["start"], e["end"]
+        if en <= win_start or s >= win_end:
+            continue
+        busy.append((max(s, win_start), min(en, win_end)))
+
+    free = []
+    cursor = win_start
+    for s, en in _merge_intervals(busy):
+        if s > cursor:
+            free.append((cursor.time(), s.time()))
+        cursor = max(cursor, en)
+    if cursor < win_end:
+        free.append((cursor.time(), win_end.time()))
+
+    free_minutes = sum(
+        (datetime.combine(day, en) - datetime.combine(day, s)).seconds // 60
+        for s, en in free
+    )
+    return (free, free_minutes, elapsed)
 
 
 def _labels_text(task: dict) -> str:
@@ -480,9 +601,13 @@ def _task_title_link(task: dict) -> str:
     return f'<a href="{html.escape(url)}">{html.escape(task["title"])}</a>'
 
 
-def _format_day_message(tasks: list, label: str, overdue: Optional[list] = None, day: Optional[date] = None) -> str:
+def _format_day_message(
+    tasks: list, label: str, overdue: Optional[list] = None, day: Optional[date] = None,
+    events: Optional[list] = None,
+) -> str:
     overdue = overdue or []
-    if not tasks and not overdue:
+    events = events or []
+    if not tasks and not overdue and not events:
         return f"🎉 No hay tareas para {label}."
 
     project_map = _project_title_map()
@@ -498,60 +623,120 @@ def _format_day_message(tasks: list, label: str, overdue: Optional[list] = None,
             lines.append(f"⚠️ {date_str}  {_priority_prefix(t)}{_task_title_link(t)} · {html.escape(project_title)}{_labels_text(t)}")
         lines.append("")
 
-    if tasks:
-        lines.append(f"📋 <b>Tareas de {label}</b> ({len(tasks)})")
+    _, free_minutes, elapsed = _free_windows_for(day, events) if day is not None else (None, None, False)
+
+    if tasks or events:
+        if tasks and events:
+            lines.append(f"📋 <b>Agenda de {label}</b> ({len(tasks)} tarea(s), {len(events)} evento(s))")
+        elif tasks:
+            lines.append(f"📋 <b>Tareas de {label}</b> ({len(tasks)})")
+        else:
+            lines.append(f"📅 <b>Eventos de {label}</b> ({len(events)})")
         lines.append("")
+
+        # Events and tasks share one chronological list (sorted by local
+        # clock time, timeless items first) so overlaps between them are
+        # visible at a glance.
+        entries = []
+        for e in events:
+            if e["all_day"]:
+                sort_key = datetime.min
+                time_str = "(todo el día)"
+            else:
+                sort_key = e["start"]
+                time_str = f'{e["start"].strftime("%H:%M")}–{e["end"].strftime("%H:%M")}'
+            marker = "📅" if e["busy"] else "🟢"
+            suffix = "" if e["busy"] else " (libre)"
+            entries.append((sort_key, f'{marker} {time_str}  {html.escape(e["title"])}{suffix}'))
+
         for t in tasks:
             due_dt = _task_due_dt(t)
-            time_str = due_dt.astimezone().strftime("%H:%M") if due_dt else "──"
+            local_dt = due_dt.astimezone().replace(tzinfo=None) if due_dt else None
+            sort_key = local_dt or datetime.min
+            time_str = local_dt.strftime("%H:%M") if local_dt else "──"
             project_title = project_map.get(t.get("project_id"), _INBOX_LABEL)
-            lines.append(f"🕐 {time_str}  {_priority_prefix(t)}{_task_title_link(t)} · {html.escape(project_title)}{_labels_text(t)}")
+            entries.append((
+                sort_key,
+                f"🕐 {time_str}  {_priority_prefix(t)}{_task_title_link(t)} · {html.escape(project_title)}{_labels_text(t)}",
+            ))
 
-        estimates = [_parse_estimate_minutes(t["title"]) for t in tasks]
-        missing = estimates.count(None)
-        total = sum(e for e in estimates if e is not None)
-        lines.append("")
-        capacity = _availability_minutes_for(day) if day is not None else None
-        if capacity is None:
-            lines.append(f"⏱ Total estimado: {_format_minutes(total)}")
-        else:
-            lines.append(f"⏱ Total estimado: {_format_minutes(total)} (disponible: {_format_minutes(capacity)})")
-            if total > capacity:
-                lines.append(f"🚨 Te pasaste por {_format_minutes(total - capacity)}")
-        if missing:
-            lines.append(f"⚠️ {missing} tarea(s) sin estimación")
+        entries.sort(key=lambda entry: entry[0])
+        for _, line in entries:
+            lines.append(line)
+
+        if tasks:
+            estimates = [_parse_estimate_minutes(t["title"]) for t in tasks]
+            missing = estimates.count(None)
+            total = sum(e for e in estimates if e is not None)
+            lines.append("")
+            if free_minutes is None:
+                lines.append(f"⏱ Total estimado: {_format_minutes(total)}")
+            else:
+                elapsed_note = " ⏳ desde ahora" if elapsed else ""
+                lines.append(
+                    f"⏱ Total estimado: {_format_minutes(total)} (disponible: {_format_minutes(free_minutes)}{elapsed_note})"
+                )
+                if total > free_minutes:
+                    lines.append(f"🚨 Te pasaste por {_format_minutes(total - free_minutes)}")
+            if missing:
+                lines.append(f"⚠️ {missing} tarea(s) sin estimación")
     elif overdue:
         lines.append(f"🎉 No hay tareas para {label} (aparte de las vencidas).")
 
     return "\n".join(lines)
 
 
-def _format_load_message(by_date: dict, start: date, days: int) -> str:
-    """Per-day estimated load vs configured availability, for spotting
-    overloaded days ahead of time (and free ones worth pulling tasks into)."""
+def _load_heat_emoji(total: int, free_minutes: Optional[int]) -> str:
+    """A quick visual read of how packed a day is: how much of its free
+    time (window minus calendar events) the estimated task load fills."""
+    if free_minutes is None:
+        return "⬜"
+    if free_minutes <= 0:
+        return "🟥"
+    ratio = total / free_minutes
+    if ratio <= 0.5:
+        return "🟩"
+    if ratio <= 0.85:
+        return "🟨"
+    if ratio <= 1.0:
+        return "🟧"
+    return "🟥"
+
+
+def _format_load_message(by_date: dict, start: date, days: int, events_by_date: Optional[dict] = None) -> str:
+    """Per-day estimated load vs free time left after calendar events, for
+    spotting overloaded days ahead of time (and free ones worth pulling
+    tasks into)."""
+    events_by_date = events_by_date or {}
     lines = [f"📊 <b>Carga de los próximos {days} día(s)</b>", ""]
     for i in range(days):
         day = start + timedelta(days=i)
         day_tasks = by_date.get(day, [])
-        day_label = f"{_WEEKDAY_SHORT[day.weekday()]} {day.strftime('%m-%d')}"
+        day_events = events_by_date.get(day, [])
+        day_label = f"{_WEEKDAY_SHORT[day.weekday()]} {day.strftime('%d/%m')}"
+
+        _, free_minutes, elapsed = _free_windows_for(day, day_events)
 
         if not day_tasks:
-            lines.append(f"{day_label}: sin tareas")
+            heat = _load_heat_emoji(0, free_minutes)
+            lines.append(f"{heat} {day_label}: sin tareas")
             continue
 
         estimates = [_parse_estimate_minutes(t["title"]) for t in day_tasks]
         missing = estimates.count(None)
         total = sum(e for e in estimates if e is not None)
-        capacity = _availability_minutes_for(day)
+        heat = _load_heat_emoji(total, free_minutes)
 
-        summary = f"{len(day_tasks)} tarea(s) · {_format_minutes(total)}"
-        if capacity is not None:
-            summary += f" / {_format_minutes(capacity)}"
-            if total > capacity:
-                summary += f" 🚨 +{_format_minutes(total - capacity)}"
+        summary = _format_minutes(total)
+        if free_minutes is not None:
+            summary += f" / {_format_minutes(free_minutes)}"
+            if elapsed:
+                summary += " ⏳"
+            if total > free_minutes:
+                summary += f" 🚨 +{_format_minutes(total - free_minutes)}"
         if missing:
             summary += f" ⚠️{missing}"
-        lines.append(f"{day_label}: {summary}")
+        lines.append(f"{heat} {day_label}: {summary}")
 
     return "\n".join(lines)
 
@@ -601,6 +786,120 @@ def _punt_due_keyboard(task_id: int) -> dict:
             [{"text": "❌ Cancelar", "callback_data": "hcancel:0"}],
         ]
     }
+
+
+# ─── Google Calendar ─────────────────────────────────────────────────────────
+
+_ics_cache: dict = {}
+_ics_cache_lock = threading.Lock()
+
+
+def _calendar_urls() -> list:
+    return _load_json(GOOGLE_CALENDAR_STATE_FILE, {"urls": [], "email": None}).get("urls", [])
+
+
+def _calendar_email() -> str:
+    """The Google account email used to find "your own" ATTENDEE entry on
+    an event, so declined invites (RSVP) can be filtered out. Empty if not
+    configured — in that case nothing gets filtered on RSVP status."""
+    return _load_json(GOOGLE_CALENDAR_STATE_FILE, {"urls": [], "email": None}).get("email") or ""
+
+
+def _declined_by(component, email: str) -> bool:
+    """True if `email` is an ATTENDEE on this event with PARTSTAT=DECLINED.
+    Google's private iCal feed still includes events you've declined, so
+    this is the only way to filter them back out."""
+    if not email:
+        return False
+    attendees = component.get("attendee")
+    if attendees is None:
+        return False
+    if not isinstance(attendees, list):
+        attendees = [attendees]
+    email_lower = email.strip().lower()
+    for att in attendees:
+        addr = str(att).lower()
+        if addr.startswith("mailto:"):
+            addr = addr[len("mailto:"):]
+        if addr == email_lower and str(att.params.get("PARTSTAT", "")).upper() == "DECLINED":
+            return True
+    return False
+
+
+def _fetch_calendar(url: str) -> "icalendar.Calendar":
+    """Fetches and parses a calendar feed, caching the *parsed* result for
+    GOOGLE_CALENDAR_CACHE_SECONDS. Google's private iCal export includes a
+    calendar's entire history, so re-parsing the feed text (not just
+    re-fetching it over the network) on every command was the real cost —
+    caching only the raw bytes still left that parse on the hot path."""
+    now = time.time()
+    with _ics_cache_lock:
+        cached = _ics_cache.get(url)
+        if cached and now - cached[0] < GOOGLE_CALENDAR_CACHE_SECONDS:
+            return cached[1]
+    resp = requests.get(url, timeout=15)
+    resp.raise_for_status()
+    cal = icalendar.Calendar.from_ical(resp.content)
+    with _ics_cache_lock:
+        _ics_cache[url] = (now, cal)
+    return cal
+
+
+def _clear_ics_cache() -> None:
+    with _ics_cache_lock:
+        _ics_cache.clear()
+
+
+def _calendar_events_for_range(start: date, end: date) -> list:
+    """Events overlapping [start, end) across all configured calendars,
+    normalized to local wall-clock datetimes and sorted by start time. Skips
+    (and logs) any calendar whose feed can't be fetched/parsed rather than
+    failing the whole call."""
+    events = []
+    email = _calendar_email()
+    for url in _calendar_urls():
+        try:
+            cal = _fetch_calendar(url)
+            occurrences = recurring_ical_events.of(cal).between(start, end)
+        except Exception as e:
+            log.warning("Could not fetch/parse calendar %s: %s", url, e)
+            continue
+        for component in occurrences:
+            if _declined_by(component, email):
+                continue
+            dtstart = component.get("dtstart").dt
+            dtend_prop = component.get("dtend")
+            dtend = dtend_prop.dt if dtend_prop else dtstart
+            all_day = not isinstance(dtstart, datetime)
+            if all_day:
+                start_dt = datetime.combine(dtstart, dtime.min)
+                end_dt = datetime.combine(dtend, dtime.min)
+            else:
+                start_dt = dtstart.astimezone().replace(tzinfo=None) if dtstart.tzinfo else dtstart
+                end_dt = dtend.astimezone().replace(tzinfo=None) if dtend.tzinfo else dtend
+            transp = str(component.get("transp", "OPAQUE")).upper()
+            events.append({
+                "title": str(component.get("summary", "(sin título)")),
+                "start": start_dt,
+                "end": end_dt,
+                "all_day": all_day,
+                "busy": transp != "TRANSPARENT",
+            })
+    events.sort(key=lambda e: e["start"])
+    return events
+
+
+def _calendar_events_for_day(day: date) -> list:
+    return _calendar_events_for_range(day, day + timedelta(days=1))
+
+
+def _calendar_events_by_date(start: date, days: int) -> dict:
+    """Events within [start, start+days-1], grouped by local calendar day."""
+    end = start + timedelta(days=days)
+    by_date: dict = {}
+    for e in _calendar_events_for_range(start, end):
+        by_date.setdefault(e["start"].date(), []).append(e)
+    return by_date
 
 
 # ─── Telegram API ───────────────────────────────────────────────────────────
@@ -814,9 +1113,12 @@ def check_daily_digest() -> None:
         log.error("Could not fetch today's tasks for daily digest: %s", e)
         return
 
+    events = _calendar_events_for_day(date.today())
+
     try:
         _telegram_call(
-            "sendMessage", chat_id=CHAT_ID, text=_format_day_message(tasks, "hoy", day=date.today()), parse_mode="HTML"
+            "sendMessage", chat_id=CHAT_ID,
+            text=_format_day_message(tasks, "hoy", day=date.today(), events=events), parse_mode="HTML"
         )
     except (requests.RequestException, RuntimeError) as e:
         log.error("Failed to send daily digest: %s", e)
@@ -1615,8 +1917,10 @@ def _handle_message(message: dict) -> None:
             _telegram_call("sendMessage", chat_id=chat_id, text=f"Error: {e}")
             return
 
+        events = _calendar_events_for_day(date.today())
         _telegram_call(
-            "sendMessage", chat_id=chat_id, text=_format_day_message(tasks, "hoy", overdue=overdue, day=date.today()),
+            "sendMessage", chat_id=chat_id,
+            text=_format_day_message(tasks, "hoy", overdue=overdue, day=date.today(), events=events),
             parse_mode="HTML",
         )
         log.info(
@@ -1633,9 +1937,11 @@ def _handle_message(message: dict) -> None:
             _telegram_call("sendMessage", chat_id=chat_id, text=f"Error: {e}")
             return
 
+        tomorrow = date.today() + timedelta(days=1)
+        events = _calendar_events_for_day(tomorrow)
         _telegram_call(
             "sendMessage", chat_id=chat_id,
-            text=_format_day_message(tasks, "mañana", day=date.today() + timedelta(days=1)),
+            text=_format_day_message(tasks, "mañana", day=tomorrow, events=events),
             parse_mode="HTML",
         )
         log.info("Sent tomorrow's task list (%d task(s)) to chat %s", len(tasks), chat_id)
@@ -1646,7 +1952,7 @@ def _handle_message(message: dict) -> None:
         if target is None:
             _telegram_call(
                 "sendMessage", chat_id=chat_id,
-                text="Usá /day YYYY-MM-DD (o 'hoy' / 'mañana'). Ej: /day 2026-08-20",
+                text="Usá /day DD/MM (o YYYY-MM-DD, 'hoy', 'mañana'). Ej: /day 20/08",
             )
             return
 
@@ -1658,8 +1964,10 @@ def _handle_message(message: dict) -> None:
             return
 
         label = target.strftime("%Y-%m-%d")
+        events = _calendar_events_for_day(target)
         _telegram_call(
-            "sendMessage", chat_id=chat_id, text=_format_day_message(tasks, label, day=target), parse_mode="HTML"
+            "sendMessage", chat_id=chat_id, text=_format_day_message(tasks, label, day=target, events=events),
+            parse_mode="HTML",
         )
         log.info("Sent task list for %s (%d task(s)) to chat %s", label, len(tasks), chat_id)
         return
@@ -1685,10 +1993,113 @@ def _handle_message(message: dict) -> None:
             _telegram_call("sendMessage", chat_id=chat_id, text=f"Error: {e}")
             return
 
+        events_by_date = _calendar_events_by_date(start, days)
         _telegram_call(
-            "sendMessage", chat_id=chat_id, text=_format_load_message(by_date, start, days), parse_mode="HTML"
+            "sendMessage", chat_id=chat_id,
+            text=_format_load_message(by_date, start, days, events_by_date=events_by_date), parse_mode="HTML"
         )
         log.info("Sent %d-day load overview to chat %s", days, chat_id)
+        return
+
+    if command in ("/calendario", "/cal"):
+        urls = _calendar_urls()
+        args = arg.split(maxsplit=1) if arg else []
+
+        if not args:
+            if not urls:
+                _telegram_call(
+                    "sendMessage", chat_id=chat_id,
+                    text=(
+                        "No hay calendarios configurados.\n\n"
+                        "Usá /calendario agregar &lt;url-ics&gt; (la dirección secreta en formato iCal: "
+                        "Google Calendar → Configuración del calendario → Integrar calendario), "
+                        "/calendario borrar &lt;número&gt;, o /calendario actualizar para forzar releer los feeds."
+                    ),
+                    parse_mode="HTML",
+                )
+                return
+            email = _calendar_email()
+            lines = ["<b>Calendarios configurados</b>", ""]
+            for i, u in enumerate(urls, 1):
+                lines.append(f"{i}. {html.escape(u)}")
+            lines.append("")
+            lines.append(
+                f"Email para RSVP: {html.escape(email)}" if email
+                else "Email para RSVP: (sin configurar — /calendario email &lt;dirección&gt;, "
+                     "así los eventos que rechazaste no aparecen)"
+            )
+            _telegram_call("sendMessage", chat_id=chat_id, text="\n".join(lines), parse_mode="HTML")
+            return
+
+        if args[0] == "agregar":
+            if len(args) < 2 or not args[1].strip():
+                _telegram_call(
+                    "sendMessage", chat_id=chat_id,
+                    text="Usá /calendario agregar <url-ics>.",
+                )
+                return
+            url = args[1].strip()
+            with _state_lock:
+                config = _load_json(GOOGLE_CALENDAR_STATE_FILE, {"urls": [], "email": None})
+                if url not in config["urls"]:
+                    config["urls"].append(url)
+                    _save_json(GOOGLE_CALENDAR_STATE_FILE, config)
+            _telegram_call("sendMessage", chat_id=chat_id, text="✓ Calendario agregado.")
+            log.info("Added calendar for chat %s", chat_id)
+            return
+
+        if args[0] == "email":
+            if len(args) < 2 or "@" not in args[1]:
+                _telegram_call(
+                    "sendMessage", chat_id=chat_id,
+                    text="Usá /calendario email <dirección>. Es la que usás en Google Calendar, para detectar tus eventos rechazados (RSVP).",
+                )
+                return
+            email = args[1].strip()
+            with _state_lock:
+                config = _load_json(GOOGLE_CALENDAR_STATE_FILE, {"urls": [], "email": None})
+                config["email"] = email
+                _save_json(GOOGLE_CALENDAR_STATE_FILE, config)
+            _telegram_call("sendMessage", chat_id=chat_id, text=f"✓ Email para RSVP: {html.escape(email)}", parse_mode="HTML")
+            log.info("Set calendar RSVP email for chat %s", chat_id)
+            return
+
+        if args[0] == "borrar":
+            if len(args) < 2:
+                _telegram_call(
+                    "sendMessage", chat_id=chat_id,
+                    text="Usá /calendario borrar <número> (ver /calendario para la lista).",
+                )
+                return
+            try:
+                idx = int(args[1].strip()) - 1
+            except ValueError:
+                idx = -1
+            if idx < 0 or idx >= len(urls):
+                _telegram_call(
+                    "sendMessage", chat_id=chat_id,
+                    text="No entendí el número. Usá /calendario para ver la lista.",
+                )
+                return
+            with _state_lock:
+                config = _load_json(GOOGLE_CALENDAR_STATE_FILE, {"urls": [], "email": None})
+                if 0 <= idx < len(config["urls"]):
+                    config["urls"].pop(idx)
+                    _save_json(GOOGLE_CALENDAR_STATE_FILE, config)
+            _telegram_call("sendMessage", chat_id=chat_id, text="✓ Calendario eliminado.")
+            log.info("Removed calendar %d for chat %s", idx, chat_id)
+            return
+
+        if args[0] == "actualizar":
+            _clear_ics_cache()
+            _telegram_call("sendMessage", chat_id=chat_id, text="✓ Cache de calendarios vaciada, se releen en la próxima consulta.")
+            log.info("Flushed calendar ICS cache for chat %s", chat_id)
+            return
+
+        _telegram_call(
+            "sendMessage", chat_id=chat_id,
+            text="Usá /calendario, /calendario agregar <url-ics>, /calendario borrar <número>, /calendario email <dirección>, o /calendario actualizar.",
+        )
         return
 
     if command in ("/disponibilidad", "/disp"):
@@ -1704,20 +2115,23 @@ def _handle_message(message: dict) -> None:
             if len(args) < 2:
                 _telegram_call(
                     "sendMessage", chat_id=chat_id,
-                    text="Usá /disponibilidad borrar <día|fecha>. Ej: /disponibilidad borrar martes",
+                    text="Usá /disponibilidad borrar <general|día|fecha>. Ej: /disponibilidad borrar martes",
                 )
                 return
             target = _parse_availability_target(args[1])
             if target is None:
                 _telegram_call(
                     "sendMessage", chat_id=chat_id,
-                    text="No entendí el día/fecha. Usá un día de la semana o YYYY-MM-DD.",
+                    text="No entendí. Usá 'general', un día de la semana, o YYYY-MM-DD.",
                 )
                 return
             kind, key = target
             with _state_lock:
-                config = _load_json(AVAILABILITY_STATE_FILE, {"weekday": {}, "date": {}})
-                config.setdefault(kind, {}).pop(key, None)
+                config = _load_json(AVAILABILITY_STATE_FILE, {"weekday": {}, "date": {}, "general": None})
+                if kind == "general":
+                    config["general"] = None
+                else:
+                    config.setdefault(kind, {}).pop(key, None)
                 _save_json(AVAILABILITY_STATE_FILE, config)
             _telegram_call("sendMessage", chat_id=chat_id, text=f"✓ Disponibilidad de {args[1]} eliminada.")
             log.info("Cleared availability override %s=%s for chat %s", kind, key, chat_id)
@@ -1727,35 +2141,41 @@ def _handle_message(message: dict) -> None:
             _telegram_call(
                 "sendMessage", chat_id=chat_id,
                 text=(
-                    "Usá /disponibilidad <día|fecha> <horas>. "
-                    "Ej: /disponibilidad martes 3h, /disponibilidad 2026-08-21 7h"
+                    "Usá /disponibilidad <general|día|fecha> <HH:MM-HH:MM>. "
+                    "Ej: /disponibilidad general 09:00-18:00, /disponibilidad martes 09:00-13:00, "
+                    "/disponibilidad 2026-08-21 10:00-16:00"
                 ),
             )
             return
 
         target = _parse_availability_target(args[0])
-        minutes = _parse_duration_minutes(args[1])
-        if target is None or minutes is None:
+        window = _parse_time_range(args[1])
+        if target is None or window is None:
             _telegram_call(
                 "sendMessage", chat_id=chat_id,
                 text=(
-                    "No entendí. Usá /disponibilidad <día|fecha> <horas>. "
-                    "Ej: /disponibilidad martes 3h, /disponibilidad 2026-08-21 7h"
+                    "No entendí. Usá /disponibilidad <general|día|fecha> <HH:MM-HH:MM>. "
+                    "Ej: /disponibilidad general 09:00-18:00, /disponibilidad martes 09:00-13:00, "
+                    "/disponibilidad 2026-08-21 10:00-16:00"
                 ),
             )
             return
 
         kind, key = target
+        window_iso = [window[0].strftime("%H:%M"), window[1].strftime("%H:%M")]
         with _state_lock:
-            config = _load_json(AVAILABILITY_STATE_FILE, {"weekday": {}, "date": {}})
-            config.setdefault(kind, {})[key] = minutes
+            config = _load_json(AVAILABILITY_STATE_FILE, {"weekday": {}, "date": {}, "general": None})
+            if kind == "general":
+                config["general"] = window_iso
+            else:
+                config.setdefault(kind, {})[key] = window_iso
             _save_json(AVAILABILITY_STATE_FILE, config)
 
         label = _WEEKDAY_DISPLAY[int(key)] if kind == "weekday" else key
         _telegram_call(
-            "sendMessage", chat_id=chat_id, text=f"✓ Disponibilidad de {label}: {_format_minutes(minutes)}"
+            "sendMessage", chat_id=chat_id, text=f"✓ Disponibilidad de {label}: {_format_time_range(window)}"
         )
-        log.info("Set availability %s=%s to %d min for chat %s", kind, key, minutes, chat_id)
+        log.info("Set availability %s=%s to %s for chat %s", kind, key, window_iso, chat_id)
         return
 
     if command == "/hecho":
@@ -1908,12 +2328,17 @@ def poll_telegram_updates() -> None:
             if callback:
                 try:
                     _handle_callback(callback)
-                except (requests.RequestException, RuntimeError):
+                except Exception:
+                    # A bug in one command must not take down this whole
+                    # listener thread (as an uncaught TypeError from a
+                    # malformed availability.json once did) — the bot would
+                    # then stop responding to everything until manually
+                    # restarted.
                     log.exception("Unhandled error processing callback")
             elif message:
                 try:
                     _handle_message(message)
-                except (requests.RequestException, RuntimeError):
+                except Exception:
                     log.exception("Unhandled error processing message")
             _save_json(BOT_STATE_FILE, {"offset": offset})
 
@@ -1936,7 +2361,8 @@ def main() -> None:
                 {"command": "tomorrow", "description": "Tareas de mañana"},
                 {"command": "day", "description": "Tareas de una fecha (YYYY-MM-DD)"},
                 {"command": "carga", "description": "Carga estimada de los próximos días"},
-                {"command": "disponibilidad", "description": "Ver o configurar horas disponibles por día"},
+                {"command": "disponibilidad", "description": "Ver o configurar ventana horaria disponible"},
+                {"command": "calendario", "description": "Ver o agregar calendarios de Google (iCal)"},
                 {"command": "hecho", "description": "Marcar una tarea de hoy como hecha"},
                 {"command": "borrar", "description": "Borrar una tarea de hoy"},
                 {"command": "tarjeta", "description": 'Etiquetar "Para tarjeta" y poner estimado en 0'},
