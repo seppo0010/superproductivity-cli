@@ -1,0 +1,140 @@
+"""New-task flow: a plain message with no pending state starts a
+project-then-due-date prompt that ends in task creation."""
+
+from __future__ import annotations
+
+from datetime import date, timedelta
+
+import requests
+
+from . import config
+from . import vikunja as vk
+from .formatting import _DUE_DATE_HINT, _DUE_DATE_KEYBOARD
+from .state import _load_json, _save_json, _state_lock
+from .telegram_api import _telegram_call
+
+
+def _start_new_task(chat_id, title: str) -> None:
+    projects = vk._real_projects()
+    if not projects:
+        _telegram_call("sendMessage", chat_id=chat_id, text="Error: no se pudieron obtener los proyectos")
+        return
+
+    state = _load_json(config.PENDING_TASK_STATE_FILE, {})
+    state[str(chat_id)] = {
+        "title": title,
+        "project_ids": [p["id"] for p in projects],
+        "project_titles": [vk._project_display(p) for p in projects],
+    }
+    _save_json(config.PENDING_TASK_STATE_FILE, state)
+
+    keyboard = {
+        "inline_keyboard": [
+            [{"text": vk._project_display(p), "callback_data": f"ntproj:{i}"}]
+            for i, p in enumerate(projects)
+        ]
+    }
+    _telegram_call(
+        "sendMessage", chat_id=chat_id, text=f"📝 {title}\n¿En qué proyecto?", reply_markup=keyboard
+    )
+    config.log.info("Started new-task flow for chat %s: %s", chat_id, title)
+
+
+def _handle_new_task_project(callback_id: str, chat_id, message_id, payload: str) -> None:
+    state = _load_json(config.PENDING_TASK_STATE_FILE, {})
+    pending = state.get(str(chat_id))
+    if not pending:
+        _telegram_call(
+            "answerCallbackQuery", callback_query_id=callback_id,
+            text="No hay ninguna tarea pendiente", show_alert=True,
+        )
+        return
+
+    project_ids = pending.get("project_ids", [])
+    try:
+        idx = int(payload)
+    except ValueError:
+        idx = -1
+
+    if 0 <= idx < len(project_ids):
+        project_id = project_ids[idx]
+        project_title = pending["project_titles"][idx]
+    else:
+        _telegram_call(
+            "answerCallbackQuery", callback_query_id=callback_id,
+            text="Opción inválida", show_alert=True,
+        )
+        return
+
+    pending["project_id"] = project_id
+    pending["project_title"] = project_title
+    state[str(chat_id)] = pending
+    _save_json(config.PENDING_TASK_STATE_FILE, state)
+
+    # Set the time-entry state as soon as the due-date keyboard is shown, so
+    # a plain "HH:MM"/"D/M"/"D/M HH:MM" reply works immediately without
+    # touching a button.
+    with _state_lock:
+        time_state = _load_json(config.PENDING_TIME_STATE_FILE, {})
+        time_state[str(chat_id)] = {
+            "kind": "newtask", "title": pending["title"],
+            "project_id": project_id, "project_title": project_title,
+            "message_id": message_id,
+        }
+        _save_json(config.PENDING_TIME_STATE_FILE, time_state)
+
+    _telegram_call(
+        "editMessageText", chat_id=chat_id, message_id=message_id,
+        text=f"📝 {pending['title']}\nProyecto: {project_title}\n¿Vencimiento? ({_DUE_DATE_HINT})",
+        reply_markup=_DUE_DATE_KEYBOARD,
+    )
+    _telegram_call("answerCallbackQuery", callback_query_id=callback_id)
+
+
+def _handle_new_task_due(callback_id: str, chat_id, message_id, payload: str) -> None:
+    state = _load_json(config.PENDING_TASK_STATE_FILE, {})
+    pending = state.get(str(chat_id))
+
+    if not pending or "project_title" not in pending:
+        _telegram_call(
+            "answerCallbackQuery", callback_query_id=callback_id,
+            text="No hay ninguna tarea pendiente", show_alert=True,
+        )
+        return
+
+    state.pop(str(chat_id), None)
+    _save_json(config.PENDING_TASK_STATE_FILE, state)
+
+    # A due-date button was pressed instead of a plain-text time/date
+    # reply — clear the pending time-entry state so a later message isn't
+    # mistaken for a leftover time entry for this already-resolved task.
+    with _state_lock:
+        time_state = _load_json(config.PENDING_TIME_STATE_FILE, {})
+        time_state.pop(str(chat_id), None)
+        _save_json(config.PENDING_TIME_STATE_FILE, time_state)
+
+    if payload == "today":
+        due_date_iso, due_label = vk._day_to_due_iso(date.today()), "Hoy"
+    elif payload == "tomorrow":
+        due_date_iso, due_label = vk._day_to_due_iso(date.today() + timedelta(days=1)), "Mañana"
+    else:
+        config.log.warning("Unknown ntdue payload: %s", payload)
+        _telegram_call("answerCallbackQuery", callback_query_id=callback_id)
+        return
+
+    try:
+        vk._vk_put(f"/projects/{pending['project_id']}/tasks", {"title": pending["title"], "due_date": due_date_iso})
+    except requests.RequestException as e:
+        config.log.error("Could not create task: %s", e)
+        _telegram_call("editMessageText", chat_id=chat_id, message_id=message_id, text=f"Error: {e}")
+        _telegram_call(
+            "answerCallbackQuery", callback_query_id=callback_id, text="Error", show_alert=True
+        )
+        return
+
+    _telegram_call(
+        "editMessageText", chat_id=chat_id, message_id=message_id,
+        text=f"✅ Creada: {pending['title']}\nProyecto: {pending['project_title']}\nVencimiento: {due_label}",
+    )
+    _telegram_call("answerCallbackQuery", callback_query_id=callback_id, text="Creada")
+    config.log.info("Created task '%s' for chat %s", pending["title"], chat_id)
