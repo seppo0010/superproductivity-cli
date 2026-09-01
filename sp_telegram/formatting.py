@@ -35,14 +35,16 @@ def _task_title_link(task: dict) -> str:
 def _format_day_message(
     tasks: list, label: str, overdue: Optional[list] = None, day: Optional[date] = None,
     events: Optional[list] = None,
-) -> str:
+) -> tuple:
+    """Returns (text, keyboard) — keyboard is a one-button "estimate this"
+    shortcut when at least one of `tasks` has no estimate yet, else None."""
     overdue = overdue or []
     events = events or []
     if day == date.today():
         now = datetime.now()
         events = [e for e in events if e["all_day"] or e["end"] > now]
     if not tasks and not overdue and not events:
-        return f"🎉 No hay tareas para {label}."
+        return f"🎉 No hay tareas para {label}.", None
 
     project_map = vk._project_title_map()
     lines = []
@@ -118,7 +120,16 @@ def _format_day_message(
     elif overdue:
         lines.append(f"🎉 No hay tareas para {label} (aparte de las vencidas).")
 
-    return "\n".join(lines)
+    keyboard = None
+    first_unestimated = next((t for t in tasks if vk._parse_estimate_minutes(t["title"]) is None), None)
+    if first_unestimated is not None:
+        keyboard = {
+            "inline_keyboard": [[
+                {"text": "⏱ Estimar tarea sin estimación", "callback_data": f"estim:{first_unestimated['id']}"}
+            ]]
+        }
+
+    return "\n".join(lines), keyboard
 
 
 def _load_heat_emoji(total: int, free_minutes: Optional[int]) -> str:

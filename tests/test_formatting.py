@@ -53,8 +53,9 @@ class TaskTitleLink(unittest.TestCase):
 class FormatDayMessageEmpty(unittest.TestCase):
     def test_nothing_pending(self):
         with patch("sp_telegram.vikunja._real_projects", return_value=[]):
-            msg = formatting._format_day_message([], "hoy")
+            msg, keyboard = formatting._format_day_message([], "hoy")
         self.assertIn("No hay tareas", msg)
+        self.assertIsNone(keyboard)
 
     def test_only_overdue(self):
         overdue_task = {
@@ -62,10 +63,30 @@ class FormatDayMessageEmpty(unittest.TestCase):
             "due_date": "2026-01-01T23:59:00Z",
         }
         with patch("sp_telegram.vikunja._real_projects", return_value=[]):
-            msg = formatting._format_day_message([], "hoy", overdue=[overdue_task])
+            msg, keyboard = formatting._format_day_message([], "hoy", overdue=[overdue_task])
         self.assertIn("Tareas vencidas", msg)
         self.assertIn("Old task", msg)
         self.assertIn("aparte de las vencidas", msg)
+        self.assertIsNone(keyboard)
+
+
+class FormatDayMessageEstimateShortcut(unittest.TestCase):
+    def test_keyboard_offers_first_unestimated_task(self):
+        tasks = [
+            {"id": 1, "title": "[15m] Estimated", "project_id": None, "due_date": "2026-01-01T09:00:00Z"},
+            {"id": 2, "title": "Missing estimate", "project_id": None, "due_date": "2026-01-01T10:00:00Z"},
+        ]
+        with patch("sp_telegram.vikunja._real_projects", return_value=[]):
+            msg, keyboard = formatting._format_day_message(tasks, "hoy")
+        self.assertIn("sin estimación", msg)
+        self.assertIsNotNone(keyboard)
+        self.assertEqual(keyboard["inline_keyboard"][0][0]["callback_data"], "estim:2")
+
+    def test_no_keyboard_when_all_estimated(self):
+        tasks = [{"id": 1, "title": "[15m] Estimated", "project_id": None, "due_date": "2026-01-01T09:00:00Z"}]
+        with patch("sp_telegram.vikunja._real_projects", return_value=[]):
+            _, keyboard = formatting._format_day_message(tasks, "hoy")
+        self.assertIsNone(keyboard)
 
 
 class TaskPickerKeyboard(unittest.TestCase):

@@ -303,6 +303,21 @@ def _estimate_duration_keyboard(task_id: int) -> dict:
     return {"inline_keyboard": rows + [[{"text": "❌ Cancelar", "callback_data": "hcancel:0"}]]}
 
 
+def _next_unestimated_task() -> Optional[dict]:
+    """The active task missing an estimate that's due soonest (undated
+    tasks, and date-only "sin hora" tasks relative to timed ones the same
+    day, sort last), for the /sinestimar catch-up command."""
+    tasks: list = _vk_get("/tasks", {"filter": "done = false"})
+    unestimated = [t for t in tasks if _parse_estimate_minutes(t["title"]) is None]
+    if not unestimated:
+        return None
+    unestimated.sort(key=lambda t: (
+        _task_local_date(t) or date.max,
+        _task_due_dt(t) or datetime.max.replace(tzinfo=timezone.utc),
+    ))
+    return unestimated[0]
+
+
 # Vikunja priority levels: 0 Unset, 1 Low, 2 Medium, 3 High, 4 Urgent, 5 DO NOW.
 _PRIORITY_OPTIONS = [(0, "Ninguna"), (1, "Baja"), (2, "Media"), (3, "Alta"), (4, "Urgente"), (5, "Ya mismo")]
 _PRIORITY_EMOJI = {3: "🔸", 4: "🔺", 5: "🚨"}

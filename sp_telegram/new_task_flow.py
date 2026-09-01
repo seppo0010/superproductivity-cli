@@ -123,13 +123,29 @@ def _handle_new_task_due(callback_id: str, chat_id, message_id, payload: str) ->
         return
 
     try:
-        vk._vk_put(f"/projects/{pending['project_id']}/tasks", {"title": pending["title"], "due_date": due_date_iso})
+        created = vk._vk_put(f"/projects/{pending['project_id']}/tasks", {"title": pending["title"], "due_date": due_date_iso})
     except requests.RequestException as e:
         config.log.error("Could not create task: %s", e)
         _telegram_call("editMessageText", chat_id=chat_id, message_id=message_id, text=f"Error: {e}")
         _telegram_call(
             "answerCallbackQuery", callback_query_id=callback_id, text="Error", show_alert=True
         )
+        return
+
+    # A title typed without a "[15m]"-style prefix has no estimate yet —
+    # every task must get one, so fall straight into the same duration
+    # picker /estimar uses instead of finishing here.
+    if vk._parse_estimate_minutes(pending["title"]) is None:
+        _telegram_call(
+            "editMessageText", chat_id=chat_id, message_id=message_id,
+            text=(
+                f"✅ Creada: {pending['title']}\nProyecto: {pending['project_title']}\n"
+                f"Vencimiento: {due_label}\n⏱ ¿Cuánto estimás que dura?"
+            ),
+            reply_markup=vk._estimate_duration_keyboard(created["id"]),
+        )
+        _telegram_call("answerCallbackQuery", callback_query_id=callback_id, text="Creada")
+        config.log.info("Created task '%s' for chat %s, prompting for estimate", pending["title"], chat_id)
         return
 
     _telegram_call(

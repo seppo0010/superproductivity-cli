@@ -1,6 +1,7 @@
 """Slash-command handling: /hoy, /mañana, /day, /carga, /calendario,
-/disponibilidad, /hecho, /borrar, /tarjeta, /estimar, /prioridad, /punt, and
-the plain-message fallback that starts the new-task or time-entry flow."""
+/disponibilidad, /hecho, /borrar, /tarjeta, /estimar, /sinestimar, /prioridad,
+/punt, and the plain-message fallback that starts the new-task or
+time-entry flow."""
 
 from __future__ import annotations
 
@@ -41,10 +42,9 @@ def _handle_message(message: dict) -> None:
             return
 
         events = ical._calendar_events_for_day(date.today())
+        text, keyboard = formatting._format_day_message(tasks, "hoy", overdue=overdue, day=date.today(), events=events)
         _telegram_call(
-            "sendMessage", chat_id=chat_id,
-            text=formatting._format_day_message(tasks, "hoy", overdue=overdue, day=date.today(), events=events),
-            parse_mode="HTML",
+            "sendMessage", chat_id=chat_id, text=text, parse_mode="HTML", reply_markup=keyboard,
         )
         config.log.info(
             "Sent today's task list (%d task(s), %d overdue) to chat %s",
@@ -62,10 +62,9 @@ def _handle_message(message: dict) -> None:
 
         tomorrow = date.today() + timedelta(days=1)
         events = ical._calendar_events_for_day(tomorrow)
+        text, keyboard = formatting._format_day_message(tasks, "mañana", day=tomorrow, events=events)
         _telegram_call(
-            "sendMessage", chat_id=chat_id,
-            text=formatting._format_day_message(tasks, "mañana", day=tomorrow, events=events),
-            parse_mode="HTML",
+            "sendMessage", chat_id=chat_id, text=text, parse_mode="HTML", reply_markup=keyboard,
         )
         config.log.info("Sent tomorrow's task list (%d task(s)) to chat %s", len(tasks), chat_id)
         return
@@ -88,9 +87,9 @@ def _handle_message(message: dict) -> None:
 
         label = target.strftime("%Y-%m-%d")
         events = ical._calendar_events_for_day(target)
+        text, keyboard = formatting._format_day_message(tasks, label, day=target, events=events)
         _telegram_call(
-            "sendMessage", chat_id=chat_id, text=formatting._format_day_message(tasks, label, day=target, events=events),
-            parse_mode="HTML",
+            "sendMessage", chat_id=chat_id, text=text, parse_mode="HTML", reply_markup=keyboard,
         )
         config.log.info("Sent task list for %s (%d task(s)) to chat %s", label, len(tasks), chat_id)
         return
@@ -414,6 +413,25 @@ def _handle_message(message: dict) -> None:
             reply_markup=formatting._task_picker_keyboard(tasks, "estim"),
         )
         config.log.info("Sent /estimar task picker (%d task(s)) to chat %s", len(tasks), chat_id)
+        return
+
+    if command == "/sinestimar":
+        try:
+            task = vk._next_unestimated_task()
+        except requests.RequestException as e:
+            config.log.error("Could not fetch next unestimated task: %s", e)
+            _telegram_call("sendMessage", chat_id=chat_id, text=f"Error: {e}")
+            return
+
+        if task is None:
+            _telegram_call("sendMessage", chat_id=chat_id, text="🎉 No hay tareas sin estimar.")
+            return
+
+        _telegram_call(
+            "sendMessage", chat_id=chat_id, text=f"⏱ {task['title']}\n¿Cuánto estimás que dura?",
+            reply_markup=vk._estimate_duration_keyboard(task["id"]),
+        )
+        config.log.info("Sent /sinestimar prompt for task %s to chat %s", task["id"], chat_id)
         return
 
     if command == "/prioridad":

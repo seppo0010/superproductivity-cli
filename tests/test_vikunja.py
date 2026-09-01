@@ -81,6 +81,32 @@ class EstimateParsing(unittest.TestCase):
         self.assertEqual(vk._set_estimate("[15m]", 30), "[30m]")
 
 
+class NextUnestimatedTask(unittest.TestCase):
+    def test_skips_estimated_and_picks_soonest_due(self):
+        tasks = [
+            {"id": 1, "title": "[15m] Estimated", "due_date": vk._day_to_due_iso(date(2026, 1, 1))},
+            {"id": 2, "title": "Later, unestimated", "due_date": vk._day_to_due_iso(date(2026, 1, 5))},
+            {"id": 3, "title": "Sooner, unestimated", "due_date": vk._day_to_due_iso(date(2026, 1, 2))},
+        ]
+        with patch("sp_telegram.vikunja._vk_get", return_value=tasks):
+            task = vk._next_unestimated_task()
+        self.assertEqual(task["id"], 3)
+
+    def test_undated_task_sorts_after_dated_ones(self):
+        tasks = [
+            {"id": 1, "title": "No due date", "due_date": ""},
+            {"id": 2, "title": "Has a due date", "due_date": vk._day_to_due_iso(date(2026, 1, 2))},
+        ]
+        with patch("sp_telegram.vikunja._vk_get", return_value=tasks):
+            task = vk._next_unestimated_task()
+        self.assertEqual(task["id"], 2)
+
+    def test_none_when_everything_estimated(self):
+        tasks = [{"id": 1, "title": "[15m] Done deal", "due_date": ""}]
+        with patch("sp_telegram.vikunja._vk_get", return_value=tasks):
+            self.assertIsNone(vk._next_unestimated_task())
+
+
 class ParseDayArg(unittest.TestCase):
     def test_hoy(self):
         self.assertEqual(vk._parse_day_arg("hoy"), date.today())

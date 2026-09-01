@@ -104,7 +104,7 @@ def _handle_time_entry(chat_id, text: str, pending: dict) -> None:
 
     if pending["kind"] == "newtask":
         try:
-            vk._vk_put(
+            created = vk._vk_put(
                 f"/projects/{pending['project_id']}/tasks",
                 {"title": pending["title"], "due_date": due_date_iso},
             )
@@ -112,6 +112,21 @@ def _handle_time_entry(chat_id, text: str, pending: dict) -> None:
             config.log.error("Could not create task: %s", e)
             _reply_to_pending(chat_id, message_id, f"Error: {e}")
             return
+
+        # See new_task_flow._handle_new_task_due: a title without a
+        # "[15m]"-style prefix still needs an estimate before we're done.
+        if vk._parse_estimate_minutes(pending["title"]) is None:
+            _reply_to_pending(
+                chat_id, message_id,
+                (
+                    f"✅ Creada: {pending['title']}\nProyecto: {pending['project_title']}\n"
+                    f"Vencimiento: {due_label}\n⏱ ¿Cuánto estimás que dura?"
+                ),
+                reply_markup=vk._estimate_duration_keyboard(created["id"]),
+            )
+            config.log.info("Created task '%s' for chat %s, prompting for estimate", pending["title"], chat_id)
+            return
+
         _reply_to_pending(
             chat_id, message_id,
             f"✅ Creada: {pending['title']}\nProyecto: {pending['project_title']}\nVencimiento: {due_label}",
