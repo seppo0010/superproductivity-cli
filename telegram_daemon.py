@@ -823,7 +823,6 @@ def _punt_due_keyboard(task_id: int) -> dict:
                 {"text": "+24 horas", "callback_data": f"puntdue:{task_id}:snooze1440"},
                 {"text": "🌆 Hoy, sin hora", "callback_data": f"puntdue:{task_id}:today"},
             ],
-            [{"text": "⏰ Elegir hora", "callback_data": f"puntdue:{task_id}:pick"}],
             [{"text": "❌ Cancelar", "callback_data": "hcancel:0"}],
         ]
     }
@@ -1185,9 +1184,10 @@ _DUE_DATE_KEYBOARD = {
             {"text": "Hoy", "callback_data": "ntdue:today"},
             {"text": "Mañana", "callback_data": "ntdue:tomorrow"},
         ],
-        [{"text": "⏰ Elegir hora", "callback_data": "ntdue:pick"}],
     ]
 }
+
+_DUE_DATE_HINT = "o escribí HH:MM, D/M[/Y] o D/M[/Y] HH:MM"
 
 
 def _start_new_task(chat_id, title: str) -> None:
@@ -1247,9 +1247,9 @@ def _handle_new_task_project(callback_id: str, chat_id, message_id, payload: str
     state[str(chat_id)] = pending
     _save_json(PENDING_TASK_STATE_FILE, state)
 
-    # Set the time-entry state as soon as the due-date keyboard is shown, not
-    # only once "⏰ Elegir hora" is pressed, so a plain "HH:MM" reply works
-    # immediately without touching a button.
+    # Set the time-entry state as soon as the due-date keyboard is shown, so
+    # a plain "HH:MM"/"D/M"/"D/M HH:MM" reply works immediately without
+    # touching a button.
     with _state_lock:
         time_state = _load_json(PENDING_TIME_STATE_FILE, {})
         time_state[str(chat_id)] = {
@@ -1261,7 +1261,7 @@ def _handle_new_task_project(callback_id: str, chat_id, message_id, payload: str
 
     _telegram_call(
         "editMessageText", chat_id=chat_id, message_id=message_id,
-        text=f"📝 {pending['title']}\nProyecto: {project_title}\n¿Vencimiento?",
+        text=f"📝 {pending['title']}\nProyecto: {project_title}\n¿Vencimiento? ({_DUE_DATE_HINT})",
         reply_markup=_DUE_DATE_KEYBOARD,
     )
     _telegram_call("answerCallbackQuery", callback_query_id=callback_id)
@@ -1281,27 +1281,9 @@ def _handle_new_task_due(callback_id: str, chat_id, message_id, payload: str) ->
     state.pop(str(chat_id), None)
     _save_json(PENDING_TASK_STATE_FILE, state)
 
-    if payload == "pick":
-        # Already set when the due-date keyboard was shown; re-set here in
-        # case the pending-task state diverged (defensive, same values).
-        with _state_lock:
-            time_state = _load_json(PENDING_TIME_STATE_FILE, {})
-            time_state[str(chat_id)] = {
-                "kind": "newtask", "title": pending["title"],
-                "project_id": pending["project_id"], "project_title": pending["project_title"],
-                "message_id": message_id,
-            }
-            _save_json(PENDING_TIME_STATE_FILE, time_state)
-        _telegram_call(
-            "editMessageText", chat_id=chat_id, message_id=message_id,
-            text=f"📝 {pending['title']}\nProyecto: {pending['project_title']}\n¿A qué hora? (HH:MM)",
-        )
-        _telegram_call("answerCallbackQuery", callback_query_id=callback_id)
-        return
-
-    # A due-date button (not "pick") was pressed instead of a plain-text
-    # time reply — clear the pending time-entry state so a later message
-    # isn't mistaken for a leftover time entry for this already-resolved task.
+    # A due-date button was pressed instead of a plain-text time/date
+    # reply — clear the pending time-entry state so a later message isn't
+    # mistaken for a leftover time entry for this already-resolved task.
     with _state_lock:
         time_state = _load_json(PENDING_TIME_STATE_FILE, {})
         time_state.pop(str(chat_id), None)
@@ -1364,9 +1346,9 @@ def _handle_punt_pick(callback_id: str, chat_id, message_id, payload: str) -> No
         )
         return
 
-    # Set the time-entry state as soon as the due-date keyboard is shown, not
-    # only once "⏰ Elegir hora" is pressed, so a plain "HH:MM" reply works
-    # immediately without touching a button.
+    # Set the time-entry state as soon as the due-date keyboard is shown, so
+    # a plain "HH:MM"/"D/M"/"D/M HH:MM" reply works immediately without
+    # touching a button.
     with _state_lock:
         time_state = _load_json(PENDING_TIME_STATE_FILE, {})
         time_state[str(chat_id)] = {
@@ -1376,7 +1358,8 @@ def _handle_punt_pick(callback_id: str, chat_id, message_id, payload: str) -> No
 
     _telegram_call(
         "editMessageText", chat_id=chat_id, message_id=message_id,
-        text=f"📅 {task['title']}\n¿Nuevo vencimiento?", reply_markup=_punt_due_keyboard(task_id),
+        text=f"📅 {task['title']}\n¿Nuevo vencimiento? ({_DUE_DATE_HINT})",
+        reply_markup=_punt_due_keyboard(task_id),
     )
     _telegram_call("answerCallbackQuery", callback_query_id=callback_id)
 
@@ -1420,25 +1403,9 @@ def _handle_punt_due(callback_id: str, chat_id, message_id, payload: str) -> Non
         )
         return
 
-    if option == "pick":
-        # Already set when the due-date keyboard was shown; re-set here in
-        # case it diverged (defensive, same values).
-        with _state_lock:
-            time_state = _load_json(PENDING_TIME_STATE_FILE, {})
-            time_state[str(chat_id)] = {
-            "kind": "punt", "task_id": task_id, "task_title": task["title"], "message_id": message_id,
-        }
-            _save_json(PENDING_TIME_STATE_FILE, time_state)
-        _telegram_call(
-            "editMessageText", chat_id=chat_id, message_id=message_id,
-            text=f"📅 {task['title']}\n¿A qué hora? (HH:MM)",
-        )
-        _telegram_call("answerCallbackQuery", callback_query_id=callback_id)
-        return
-
-    # A due-date button (not "pick") was pressed instead of a plain-text
-    # time reply — clear the pending time-entry state so a later message
-    # isn't mistaken for a leftover time entry for this already-resolved task.
+    # A due-date button was pressed instead of a plain-text time/date
+    # reply — clear the pending time-entry state so a later message isn't
+    # mistaken for a leftover time entry for this already-resolved task.
     with _state_lock:
         time_state = _load_json(PENDING_TIME_STATE_FILE, {})
         time_state.pop(str(chat_id), None)
@@ -1672,9 +1639,59 @@ def _handle_priority_set(callback_id: str, chat_id, message_id, payload: str) ->
     log.info("Set priority for task %s to %d", task_id, level)
 
 
-# ─── Time-entry flow (plain "HH:MM" reply after "⏰ Elegir hora") ───────────
+# ─── Time-entry flow (plain "HH:MM" / "D/M[/Y]" / "D/M[/Y] HH:MM" reply) ───
 
 _TIME_RE = re.compile(r"^([01]?\d|2[0-3]):([0-5]\d)$")
+_DATE_TIME_RE = re.compile(r"^(\d{1,2})/(\d{1,2})(?:/(\d{4}|\d{2}))?(?:\s+([01]?\d|2[0-3]):([0-5]\d))?$")
+
+
+def _resolve_due_reply(text: str) -> Optional[tuple]:
+    """Parses a plain-text due-date reply typed after a due-date prompt.
+    Accepts "HH:MM" (next occurrence of that time), "D/M[/Y] HH:MM" (that
+    date at that time), and "D/M[/Y]" (that date, with no specific time —
+    the 23:59 "sin hora" sentinel). Y may be 2 or 4 digits; a 2-digit year
+    is taken as 2000+YY. Without an explicit year, "D/M[/Y]" picks the next
+    occurrence of that day/month (this year, or next year if it's already
+    passed); with a year, it's used as given. Returns (due_date_iso,
+    due_label), or None if `text` matches neither format."""
+    text = text.strip()
+
+    m = _TIME_RE.match(text)
+    if m:
+        hour, minute = int(m.group(1)), int(m.group(2))
+        due_date_iso = _next_occurrence_iso(hour, minute)
+        due_label = _parse_vikunja_ts(due_date_iso).astimezone().strftime("%Y-%m-%d %H:%M")
+        return due_date_iso, due_label
+
+    m = _DATE_TIME_RE.match(text)
+    if m:
+        day, month, year_s, hour_s, minute_s = m.group(1, 2, 3, 4, 5)
+        today = date.today()
+        if year_s is None:
+            year = today.year
+        elif len(year_s) == 2:
+            year = 2000 + int(year_s)
+        else:
+            year = int(year_s)
+        try:
+            candidate = date(year, int(month), int(day))
+        except ValueError:
+            return None
+
+        if hour_s is not None:
+            hour, minute = int(hour_s), int(minute_s)
+            if year_s is None and datetime(candidate.year, candidate.month, candidate.day, hour, minute) <= datetime.now():
+                candidate = candidate.replace(year=candidate.year + 1)
+            due_date_iso = _local_time_to_iso(candidate, hour, minute)
+            due_label = _parse_vikunja_ts(due_date_iso).astimezone().strftime("%Y-%m-%d %H:%M")
+        else:
+            if year_s is None and candidate < today:
+                candidate = candidate.replace(year=candidate.year + 1)
+            due_date_iso = _day_to_due_iso(candidate)
+            due_label = candidate.strftime("%Y-%m-%d") + ", sin hora"
+        return due_date_iso, due_label
+
+    return None
 
 
 def _reply_to_pending(chat_id, message_id: Optional[int], text: str, reply_markup: Optional[dict] = None) -> None:
@@ -1695,14 +1712,15 @@ def _reply_to_pending(chat_id, message_id: Optional[int], text: str, reply_marku
 def _handle_time_entry(chat_id, text: str, pending: dict) -> None:
     message_id = pending.get("message_id")
 
-    m = _TIME_RE.match(text.strip())
-    if not m:
-        _reply_to_pending(chat_id, message_id, "Formato inválido. Escribí la hora como HH:MM (ej: 14:30).")
+    parsed = _resolve_due_reply(text)
+    if parsed is None:
+        _reply_to_pending(
+            chat_id, message_id,
+            "Formato inválido. Escribí la hora (HH:MM), una fecha (D/M o D/M/Y) o ambas "
+            "(D/M[/Y] HH:MM); ej: 14:30, 5/9, 5/9/2027 o 5/9 13:00.",
+        )
         return
-
-    hour, minute = int(m.group(1)), int(m.group(2))
-    due_date_iso = _next_occurrence_iso(hour, minute)
-    due_label = _parse_vikunja_ts(due_date_iso).astimezone().strftime("%Y-%m-%d %H:%M")
+    due_date_iso, due_label = parsed
 
     with _state_lock:
         state = _load_json(PENDING_TIME_STATE_FILE, {})
