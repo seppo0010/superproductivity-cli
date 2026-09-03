@@ -51,6 +51,9 @@ def _handle_callback(callback: dict) -> None:
             task_state = _load_json(config.PENDING_TASK_STATE_FILE, {})
             task_state.pop(str(chat_id), None)
             _save_json(config.PENDING_TASK_STATE_FILE, task_state)
+            estimate_state = _load_json(config.PENDING_ESTIMATE_STATE_FILE, {})
+            estimate_state.pop(str(chat_id), None)
+            _save_json(config.PENDING_ESTIMATE_STATE_FILE, estimate_state)
         _telegram_call("editMessageText", chat_id=chat_id, message_id=message_id, text="Cancelado")
         _telegram_call("answerCallbackQuery", callback_query_id=callback_id)
         return

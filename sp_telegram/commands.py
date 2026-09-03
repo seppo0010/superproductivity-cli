@@ -14,6 +14,7 @@ from . import config
 from . import formatting
 from . import ical
 from . import vikunja as vk
+from .estimate_priority_flow import _handle_estimate_text
 from .new_task_flow import _start_new_task
 from .state import _load_json, _save_json, _state_lock
 from .telegram_api import _telegram_call
@@ -427,10 +428,14 @@ def _handle_message(message: dict) -> None:
             _telegram_call("sendMessage", chat_id=chat_id, text="🎉 No hay tareas sin estimar.")
             return
 
-        _telegram_call(
+        sent = _telegram_call(
             "sendMessage", chat_id=chat_id, text=f"⏱ {task['title']}\n¿Cuánto estimás que dura?",
             reply_markup=vk._estimate_duration_keyboard(task["id"]),
         )
+        with _state_lock:
+            estimate_state = _load_json(config.PENDING_ESTIMATE_STATE_FILE, {})
+            estimate_state[str(chat_id)] = {"task_id": task["id"], "message_id": sent["message_id"]}
+            _save_json(config.PENDING_ESTIMATE_STATE_FILE, estimate_state)
         config.log.info("Sent /sinestimar prompt for task %s to chat %s", task["id"], chat_id)
         return
 
@@ -481,6 +486,12 @@ def _handle_message(message: dict) -> None:
     pending_time = pending_time_state.get(str(chat_id))
     if pending_time:
         _handle_time_entry(chat_id, text, pending_time)
+        return
+
+    pending_estimate_state = _load_json(config.PENDING_ESTIMATE_STATE_FILE, {})
+    pending_estimate = pending_estimate_state.get(str(chat_id))
+    if pending_estimate:
+        _handle_estimate_text(chat_id, text, pending_estimate)
         return
 
     _start_new_task(chat_id, text)

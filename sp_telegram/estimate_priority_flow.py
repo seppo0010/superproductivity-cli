@@ -10,9 +10,42 @@ from . import config
 from . import vikunja as vk
 from .state import _load_json, _save_json, _state_lock
 from .telegram_api import _telegram_call
+from .time_entry_flow import _reply_to_pending
 
 
 # ─── Estimate flow (set/change a task's duration estimate) ────────────────
+
+def _arm_pending_estimate(chat_id, task_id: int, message_id) -> None:
+    """Records that a plain-text duration reply (e.g. "18m") typed next
+    should be applied as this task's estimate, instead of starting a new
+    task. Armed wherever the duration keyboard is shown."""
+    with _state_lock:
+        state = _load_json(config.PENDING_ESTIMATE_STATE_FILE, {})
+        state[str(chat_id)] = {"task_id": task_id, "message_id": message_id}
+        _save_json(config.PENDING_ESTIMATE_STATE_FILE, state)
+
+
+def _clear_pending_estimate(chat_id) -> None:
+    with _state_lock:
+        state = _load_json(config.PENDING_ESTIMATE_STATE_FILE, {})
+        state.pop(str(chat_id), None)
+        _save_json(config.PENDING_ESTIMATE_STATE_FILE, state)
+
+
+def _apply_estimate(task: dict, minutes: int) -> str:
+    """Sets `task`'s estimate to `minutes` in Vikunja and snapshots undo
+    state. Returns the new title."""
+    new_title = vk._set_estimate(task["title"], minutes)
+    if new_title != task["title"]:
+        vk._vk_task_update(task["id"], {"title": new_title})
+
+    with _state_lock:
+        state = _load_json(config.UNDO_STATE_FILE, {})
+        state[str(task["id"])] = {"action": "estimate", "task": task}
+        _save_json(config.UNDO_STATE_FILE, state)
+
+    return new_title
+
 
 def _handle_estimate_pick(callback_id: str, chat_id, message_id, payload: str) -> None:
     try:
@@ -47,6 +80,7 @@ def _handle_estimate_pick(callback_id: str, chat_id, message_id, payload: str) -
         text=f"⏱ {task['title']}\n¿Cuánto estimás que dura?",
         reply_markup=vk._estimate_duration_keyboard(task_id),
     )
+    _arm_pending_estimate(chat_id, task_id, message_id)
     _telegram_call("answerCallbackQuery", callback_query_id=callback_id)
 
 
@@ -77,10 +111,8 @@ def _handle_estimate_duration(callback_id: str, chat_id, message_id, payload: st
         )
         return
 
-    new_title = vk._set_estimate(task["title"], minutes)
     try:
-        if new_title != task["title"]:
-            vk._vk_task_update(task_id, {"title": new_title})
+        new_title = _apply_estimate(task, minutes)
     except requests.RequestException as e:
         config.log.error("Could not update estimate for task %s: %s", task_id, e)
         _telegram_call(
@@ -89,10 +121,7 @@ def _handle_estimate_duration(callback_id: str, chat_id, message_id, payload: st
         )
         return
 
-    with _state_lock:
-        state = _load_json(config.UNDO_STATE_FILE, {})
-        state[str(task_id)] = {"action": "estimate", "task": task}
-        _save_json(config.UNDO_STATE_FILE, state)
+    _clear_pending_estimate(chat_id)
 
     result_text = f"⏱ {new_title} — estimado en {'0' if minutes == 0 else vk._format_minutes(minutes)}"
     try:
@@ -104,6 +133,49 @@ def _handle_estimate_duration(callback_id: str, chat_id, message_id, payload: st
         config.log.error("Could not edit Telegram message: %s", e)
     _telegram_call("answerCallbackQuery", callback_query_id=callback_id, text="Estimado")
     config.log.info("Set estimate for task %s to %d min", task_id, minutes)
+
+
+def _handle_estimate_text(chat_id, text: str, pending: dict) -> None:
+    """Applies a plain-text duration reply (e.g. "18m", "1h30m", "0") typed
+    instead of pressing a button on the duration keyboard."""
+    message_id = pending.get("message_id")
+    task_id = pending["task_id"]
+
+    minutes = vk._parse_duration_minutes(text)
+    if minutes is None:
+        _reply_to_pending(
+            chat_id, message_id,
+            "Formato inválido. Escribí la duración (ej: 18m, 1h30m, 1h, 0).",
+        )
+        return
+
+    try:
+        task = vk._find_task(task_id)
+    except requests.RequestException as e:
+        config.log.error("Could not fetch task %s: %s", task_id, e)
+        _reply_to_pending(chat_id, message_id, f"Error: {e}")
+        return
+
+    if task is None:
+        _clear_pending_estimate(chat_id)
+        _reply_to_pending(chat_id, message_id, "Esa tarea ya no existe")
+        return
+
+    try:
+        new_title = _apply_estimate(task, minutes)
+    except requests.RequestException as e:
+        config.log.error("Could not update estimate for task %s: %s", task_id, e)
+        _reply_to_pending(chat_id, message_id, f"Error: {e}")
+        return
+
+    _clear_pending_estimate(chat_id)
+
+    result_text = f"⏱ {new_title} — estimado en {'0' if minutes == 0 else vk._format_minutes(minutes)}"
+    _reply_to_pending(
+        chat_id, message_id, result_text,
+        reply_markup={"inline_keyboard": [[{"text": "↩️ Deshacer", "callback_data": f"undo:{task_id}"}]]},
+    )
+    config.log.info("Set estimate for task %s to %d min (typed reply)", task_id, minutes)
 
 
 # ─── Priority flow (set/change a task's priority) ──────────────────────────

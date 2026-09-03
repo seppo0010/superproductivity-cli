@@ -124,6 +124,10 @@ def _handle_time_entry(chat_id, text: str, pending: dict) -> None:
                 ),
                 reply_markup=vk._estimate_duration_keyboard(created["id"]),
             )
+            with _state_lock:
+                estimate_state = _load_json(config.PENDING_ESTIMATE_STATE_FILE, {})
+                estimate_state[str(chat_id)] = {"task_id": created["id"], "message_id": message_id}
+                _save_json(config.PENDING_ESTIMATE_STATE_FILE, estimate_state)
             config.log.info("Created task '%s' for chat %s, prompting for estimate", pending["title"], chat_id)
             return
 

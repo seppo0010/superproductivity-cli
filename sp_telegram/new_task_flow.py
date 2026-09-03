@@ -144,6 +144,10 @@ def _handle_new_task_due(callback_id: str, chat_id, message_id, payload: str) ->
             ),
             reply_markup=vk._estimate_duration_keyboard(created["id"]),
         )
+        with _state_lock:
+            estimate_state = _load_json(config.PENDING_ESTIMATE_STATE_FILE, {})
+            estimate_state[str(chat_id)] = {"task_id": created["id"], "message_id": message_id}
+            _save_json(config.PENDING_ESTIMATE_STATE_FILE, estimate_state)
         _telegram_call("answerCallbackQuery", callback_query_id=callback_id, text="Creada")
         config.log.info("Created task '%s' for chat %s, prompting for estimate", pending["title"], chat_id)
         return

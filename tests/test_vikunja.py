@@ -62,6 +62,29 @@ class EstimateParsing(unittest.TestCase):
     def test_unparseable_prefix(self):
         self.assertIsNone(vk._parse_estimate_minutes("[whatever] Task"))
 
+
+class ParseDurationMinutes(unittest.TestCase):
+    def test_minutes_only(self):
+        self.assertEqual(vk._parse_duration_minutes("18m"), 18)
+
+    def test_hours_and_minutes(self):
+        self.assertEqual(vk._parse_duration_minutes("1h30m"), 90)
+
+    def test_hours_only(self):
+        self.assertEqual(vk._parse_duration_minutes("2h"), 120)
+
+    def test_zero(self):
+        self.assertEqual(vk._parse_duration_minutes("0"), 0)
+
+    def test_strips_whitespace(self):
+        self.assertEqual(vk._parse_duration_minutes("  15m  "), 15)
+
+    def test_garbage(self):
+        self.assertIsNone(vk._parse_duration_minutes("whatever"))
+
+    def test_empty(self):
+        self.assertIsNone(vk._parse_duration_minutes(""))
+
     def test_format_minutes(self):
         self.assertEqual(vk._format_minutes(0), "0m")
         self.assertEqual(vk._format_minutes(45), "45m")

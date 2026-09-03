@@ -245,6 +245,20 @@ def _project_title_map() -> dict:
 
 
 _ESTIMATE_RE = re.compile(r"^\[([^\]]*)\]")
+_DURATION_RE = re.compile(r"(?:(\d+)h)?(?:(\d+)m)?")
+
+
+def _parse_duration_minutes(text: str) -> Optional[int]:
+    """Parse a bare duration like '5m' / '1h30m' / '1h' / '0' (no brackets)
+    into minutes, or None if it doesn't parse. Shared by the '[...]'
+    title-prefix estimate convention and free-text duration replies."""
+    content = text.strip()
+    if content == "0":
+        return 0
+    hm = _DURATION_RE.fullmatch(content)
+    if not hm or not (hm.group(1) or hm.group(2)):
+        return None
+    return int(hm.group(1) or 0) * 60 + int(hm.group(2) or 0)
 
 
 def _parse_estimate_minutes(title: str) -> Optional[int]:
@@ -253,13 +267,7 @@ def _parse_estimate_minutes(title: str) -> Optional[int]:
     m = _ESTIMATE_RE.match(title.strip())
     if not m:
         return None
-    content = m.group(1)
-    if content == "0":
-        return 0
-    hm = re.fullmatch(r"(?:(\d+)h)?(?:(\d+)m)?", content)
-    if not hm or not (hm.group(1) or hm.group(2)):
-        return None
-    return int(hm.group(1) or 0) * 60 + int(hm.group(2) or 0)
+    return _parse_duration_minutes(m.group(1))
 
 
 def _format_minutes(total: int) -> str:
