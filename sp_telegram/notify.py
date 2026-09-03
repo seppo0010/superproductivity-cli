@@ -200,10 +200,11 @@ def check_daily_digest() -> None:
 
     events = ical._calendar_events_for_day(date.today())
 
+    text, _keyboard = formatting._format_day_message(tasks, "hoy", day=date.today(), events=events)
     try:
         _telegram_call(
             "sendMessage", chat_id=config.CHAT_ID,
-            text=formatting._format_day_message(tasks, "hoy", day=date.today(), events=events), parse_mode="HTML"
+            text=text, parse_mode="HTML"
         )
     except (requests.RequestException, RuntimeError) as e:
         config.log.error("Failed to send daily digest: %s", e)
