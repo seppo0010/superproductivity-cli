@@ -220,6 +220,20 @@ def _punt_button_label(task: dict, project_map: dict, today: date) -> str:
     return f"{prefix} · {vk._priority_prefix(task)}{project_title} · {task['title']}"
 
 
+def _day_picker_keyboard() -> dict:
+    """Two-column picker of the next 14 days, for /day with no argument."""
+    today = date.today()
+    days = [today + timedelta(days=i) for i in range(14)]
+    rows = []
+    for i in range(0, len(days), 2):
+        row = []
+        for day in days[i:i + 2]:
+            label = f"{vk._WEEKDAY_SHORT[day.weekday()]} {day.strftime('%d/%m')}"
+            row.append({"text": label, "callback_data": f"daypick:{day.strftime('%Y-%m-%d')}"})
+        rows.append(row)
+    return {"inline_keyboard": rows}
+
+
 def _punt_due_keyboard(task_id: int) -> dict:
     return {
         "inline_keyboard": [

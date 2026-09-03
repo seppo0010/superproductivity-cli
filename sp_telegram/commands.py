@@ -71,6 +71,13 @@ def _handle_message(message: dict) -> None:
         return
 
     if command in ("/day", "/dia"):
+        if not arg:
+            _telegram_call(
+                "sendMessage", chat_id=chat_id, text="¿Qué día?",
+                reply_markup=formatting._day_picker_keyboard(),
+            )
+            return
+
         target = vk._parse_day_arg(arg)
         if target is None:
             _telegram_call(

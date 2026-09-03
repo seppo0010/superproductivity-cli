@@ -9,6 +9,8 @@ from datetime import date, datetime, timedelta, timezone
 import requests
 
 from . import config
+from . import formatting
+from . import ical
 from . import vikunja as vk
 from .estimate_priority_flow import (
     _handle_estimate_duration,
@@ -77,6 +79,9 @@ def _handle_callback(callback: dict) -> None:
         return
     if action == "priolvl":
         _handle_priority_set(callback_id, chat_id, message_id, payload)
+        return
+    if action == "daypick":
+        _handle_day_pick(callback_id, chat_id, message_id, payload)
         return
     task_id = int(payload)
 
@@ -153,3 +158,32 @@ def _handle_callback(callback: dict) -> None:
         config.log.error("Could not edit Telegram message: %s", e)
     _telegram_call("answerCallbackQuery", callback_query_id=callback_id, text="Listo")
     config.log.info("Handled '%s' for task %s", action, task_id)
+
+
+def _handle_day_pick(callback_id: str, chat_id, message_id, payload: str) -> None:
+    try:
+        target = datetime.strptime(payload, "%Y-%m-%d").date()
+    except ValueError:
+        config.log.warning("Malformed daypick payload: %s", payload)
+        _telegram_call("answerCallbackQuery", callback_query_id=callback_id)
+        return
+
+    try:
+        tasks = vk._tasks_for_date(target)
+    except requests.RequestException as e:
+        config.log.error("Could not fetch tasks for %s: %s", target, e)
+        _telegram_call(
+            "answerCallbackQuery", callback_query_id=callback_id,
+            text=f"Error: {e}", show_alert=True,
+        )
+        return
+
+    label = target.strftime("%Y-%m-%d")
+    events = ical._calendar_events_for_day(target)
+    text, keyboard = formatting._format_day_message(tasks, label, day=target, events=events)
+    _telegram_call(
+        "editMessageText", chat_id=chat_id, message_id=message_id, text=text,
+        parse_mode="HTML", reply_markup=keyboard,
+    )
+    _telegram_call("answerCallbackQuery", callback_query_id=callback_id)
+    config.log.info("Sent task list for %s (%d task(s)) to chat %s via picker", label, len(tasks), chat_id)
