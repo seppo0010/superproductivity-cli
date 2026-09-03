@@ -221,16 +221,16 @@ def _punt_button_label(task: dict, project_map: dict, today: date) -> str:
 
 
 def _day_picker_keyboard() -> dict:
-    """Two-column picker of the next 14 days, for /day with no argument."""
+    """Picker of the next 14 days, for /day with no argument: this week's
+    7 days in the left column, next week's 7 in the right column."""
     today = date.today()
-    days = [today + timedelta(days=i) for i in range(14)]
-    rows = []
-    for i in range(0, len(days), 2):
-        row = []
-        for day in days[i:i + 2]:
-            label = f"{vk._WEEKDAY_SHORT[day.weekday()]} {day.strftime('%d/%m')}"
-            row.append({"text": label, "callback_data": f"daypick:{day.strftime('%Y-%m-%d')}"})
-        rows.append(row)
+
+    def button(offset: int) -> dict:
+        day = today + timedelta(days=offset)
+        label = f"{vk._WEEKDAY_SHORT[day.weekday()]} {day.strftime('%d/%m')}"
+        return {"text": label, "callback_data": f"daypick:{day.strftime('%Y-%m-%d')}"}
+
+    rows = [[button(i), button(i + 7)] for i in range(7)]
     return {"inline_keyboard": rows}
 
 
