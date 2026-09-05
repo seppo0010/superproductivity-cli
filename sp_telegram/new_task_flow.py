@@ -1,5 +1,5 @@
-"""New-task flow: a plain message with no pending state starts a
-project-then-due-date prompt that ends in task creation."""
+"""New-task flow: a plain message with no pending state starts an (optional
+emoji-pick then) project-then-due-date prompt that ends in task creation."""
 
 from __future__ import annotations
 
@@ -8,13 +8,17 @@ from datetime import date, timedelta
 import requests
 
 from . import config
+from . import emoji_suggest
 from . import vikunja as vk
 from .formatting import _DUE_DATE_HINT, _DUE_DATE_KEYBOARD
 from .state import _load_json, _save_json, _state_lock
 from .telegram_api import _telegram_call
 
 
-def _start_new_task(chat_id, title: str) -> None:
+def _show_project_picker(chat_id, title: str, message_id=None) -> None:
+    """Show the project-choice keyboard for `title`, either as a new message
+    (`message_id=None`) or by editing an existing one (e.g. the emoji-pick
+    message, once a choice has been made there)."""
     projects = vk._real_projects()
     if not projects:
         _telegram_call("sendMessage", chat_id=chat_id, text="Error: no se pudieron obtener los proyectos")
@@ -34,10 +38,46 @@ def _start_new_task(chat_id, title: str) -> None:
             for i, p in enumerate(projects)
         ]
     }
-    _telegram_call(
-        "sendMessage", chat_id=chat_id, text=f"📝 {title}\n¿En qué proyecto?", reply_markup=keyboard
-    )
+    text = f"📝 {title}\n¿En qué proyecto?"
+    if message_id is None:
+        _telegram_call("sendMessage", chat_id=chat_id, text=text, reply_markup=keyboard)
+    else:
+        _telegram_call("editMessageText", chat_id=chat_id, message_id=message_id, text=text, reply_markup=keyboard)
     config.log.info("Started new-task flow for chat %s: %s", chat_id, title)
+
+
+def _start_new_task(chat_id, title: str) -> None:
+    suggestions = emoji_suggest.suggest_emojis(title)
+    if not suggestions:
+        _show_project_picker(chat_id, title)
+        return
+
+    state = _load_json(config.PENDING_TASK_STATE_FILE, {})
+    state[str(chat_id)] = {"title": title}
+    _save_json(config.PENDING_TASK_STATE_FILE, state)
+
+    keyboard = {
+        "inline_keyboard": [
+            [{"text": e, "callback_data": f"ntemoji:{e}"} for e in suggestions],
+            [{"text": "⏭ Sin emoji", "callback_data": "ntemoji:skip"}, {"text": "❌ Cancelar", "callback_data": "hcancel:0"}],
+        ]
+    }
+    _telegram_call("sendMessage", chat_id=chat_id, text=f"📝 {title}\n¿Emoji?", reply_markup=keyboard)
+
+
+def _handle_new_task_emoji(callback_id: str, chat_id, message_id, payload: str) -> None:
+    state = _load_json(config.PENDING_TASK_STATE_FILE, {})
+    pending = state.get(str(chat_id))
+    if not pending:
+        _telegram_call(
+            "answerCallbackQuery", callback_query_id=callback_id,
+            text="No hay ninguna tarea pendiente", show_alert=True,
+        )
+        return
+
+    title = pending["title"] if payload == "skip" else f"{payload} {pending['title']}"
+    _telegram_call("answerCallbackQuery", callback_query_id=callback_id)
+    _show_project_picker(chat_id, title, message_id=message_id)
 
 
 def _handle_new_task_project(callback_id: str, chat_id, message_id, payload: str) -> None:

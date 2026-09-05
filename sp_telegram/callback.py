@@ -18,7 +18,7 @@ from .estimate_priority_flow import (
     _handle_priority_pick,
     _handle_priority_set,
 )
-from .new_task_flow import _handle_new_task_due, _handle_new_task_project
+from .new_task_flow import _handle_new_task_due, _handle_new_task_emoji, _handle_new_task_project
 from .punt_flow import _handle_punt_due, _handle_punt_pick
 from .state import _load_json, _save_json, _state_lock
 from .telegram_api import _telegram_call
@@ -39,6 +39,9 @@ def _handle_callback(callback: dict) -> None:
         _telegram_call("answerCallbackQuery", callback_query_id=callback_id)
         return
 
+    if action == "ntemoji":
+        _handle_new_task_emoji(callback_id, chat_id, message_id, payload)
+        return
     if action == "ntproj":
         _handle_new_task_project(callback_id, chat_id, message_id, payload)
         return

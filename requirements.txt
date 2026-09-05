@@ -1,3 +1,4 @@
 requests>=2.31
 icalendar>=5.0
 recurring-ical-events>=3.0
+emoji>=2.0

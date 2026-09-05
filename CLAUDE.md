@@ -24,6 +24,9 @@ Telegram poll loop, reconciliation loop) and validates required env vars.
   (occupancy schedule) config and free-time calculation.
 - `ical.py` — fetches/parses configured iCal feeds (commonly a Google Calendar secret address, but
   any iCal feed works) and expands recurring events; caches parsed calendars in memory.
+- `emoji_suggest.py` — `suggest_emojis(title)`: best-effort emoji suggestions for a new task title,
+  used by `new_task_flow.py`. A small hand-written Spanish task-verb overlay, backed by a much larger
+  automatic reverse index built at import time from the `emoji` package's Spanish CLDR names.
 - `formatting.py` — renders tasks/events into Telegram message text (HTML parse mode) and inline keyboards.
 - `telegram_api.py` — thin Telegram Bot API wrapper (`_telegram_call`) + due-notification message builder.
 - `notify.py` — webhook receiver (push path for `task.overdue`/`tasks.overdue`), the reconciliation
@@ -49,6 +52,11 @@ Telegram poll loop, reconciliation loop) and validates required env vars.
   can touch (webhook thread, poll thread, main reconciliation loop) — see existing call sites for the pattern.
 - Vikunja's task update PATCH resets any field omitted from the body, so `_vk_task_update` always
   does fetch-merge-write, never a naive partial update.
+- **New-task emoji prefix**: `new_task_flow._start_new_task` inserts an emoji-pick step (skipped if
+  `emoji_suggest.suggest_emojis` finds nothing) before the project/due-date prompts, prepending the
+  chosen emoji to the title. It always goes *after* any `[15m]`-style estimate prefix — `_set_estimate`
+  forces that bracket to the very front regardless of what's already there, so the stored order ends
+  up `[15m] 📞 Title`.
 
 ## Tests
 
