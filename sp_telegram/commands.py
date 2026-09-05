@@ -15,7 +15,7 @@ from . import formatting
 from . import ical
 from . import vikunja as vk
 from .estimate_priority_flow import _handle_estimate_text
-from .new_task_flow import _start_new_task
+from .new_task_flow import _handle_new_task_emoji_text, _start_new_task
 from .state import _load_json, _save_json, _state_lock
 from .telegram_api import _telegram_call
 from .time_entry_flow import _handle_time_entry
@@ -487,6 +487,12 @@ def _handle_message(message: dict) -> None:
         return
 
     if text.startswith("/"):
+        return
+
+    pending_task_state = _load_json(config.PENDING_TASK_STATE_FILE, {})
+    pending_task = pending_task_state.get(str(chat_id))
+    if pending_task and "project_ids" not in pending_task:
+        _handle_new_task_emoji_text(chat_id, text, pending_task)
         return
 
     pending_time_state = _load_json(config.PENDING_TIME_STATE_FILE, {})

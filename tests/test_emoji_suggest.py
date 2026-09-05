@@ -31,5 +31,19 @@ class SuggestEmojis(unittest.TestCase):
         self.assertEqual(len(suggestions), len(set(suggestions)))
 
 
+class ExtractEmojis(unittest.TestCase):
+    def test_finds_emoji_in_text(self):
+        self.assertEqual(emoji_suggest.extract_emojis("Llamar a mamá 📞 hoy"), ["📞"])
+
+    def test_multiple_emoji_in_order(self):
+        self.assertEqual(emoji_suggest.extract_emojis("hola 😀🎉"), ["😀", "🎉"])
+
+    def test_dedup_repeated_emoji(self):
+        self.assertEqual(emoji_suggest.extract_emojis("📞📞 llamar"), ["📞"])
+
+    def test_no_emoji_returns_empty(self):
+        self.assertEqual(emoji_suggest.extract_emojis("Llamar al dentista"), [])
+
+
 if __name__ == "__main__":
     unittest.main()

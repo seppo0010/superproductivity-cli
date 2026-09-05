@@ -75,6 +75,18 @@ def _build_library_index() -> dict[str, str]:
 _LIBRARY_INDEX = _build_library_index()
 
 
+def extract_emojis(text: str) -> list[str]:
+    """Distinct emoji characters found in `text`, in first-appearance order.
+    Used for a typed-emoji reply to the new-task emoji prompt (the user types
+    an emoji instead of pressing one of the suggested-emoji buttons)."""
+    found: list[str] = []
+    for match in _emoji_lib.emoji_list(text):
+        ch = match["emoji"]
+        if ch not in found:
+            found.append(ch)
+    return found
+
+
 def suggest_emojis(title: str, max_suggestions: int = 3) -> list[str]:
     """Best-effort emoji suggestions for `title`, most relevant first.
 

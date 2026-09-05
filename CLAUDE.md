@@ -56,7 +56,12 @@ Telegram poll loop, reconciliation loop) and validates required env vars.
   `emoji_suggest.suggest_emojis` finds nothing) before the project/due-date prompts, prepending the
   chosen emoji to the title. It always goes *after* any `[15m]`-style estimate prefix — `_set_estimate`
   forces that bracket to the very front regardless of what's already there, so the stored order ends
-  up `[15m] 📞 Title`.
+  up `[15m] 📞 Title`. While that prompt is showing, a plain-text reply is also accepted instead of a
+  button press: `commands._handle_message` detects the pending state (present in
+  `PENDING_TASK_STATE_FILE` but missing `project_ids`) and routes it to
+  `new_task_flow._handle_new_task_emoji_text`, which scans the message for emoji characters via
+  `emoji_suggest.extract_emojis` and uses whichever it finds, letting the user type an emoji that
+  wasn't among the suggested buttons.
 
 ## Tests
 

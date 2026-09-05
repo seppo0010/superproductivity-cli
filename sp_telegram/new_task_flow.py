@@ -52,17 +52,17 @@ def _start_new_task(chat_id, title: str) -> None:
         _show_project_picker(chat_id, title)
         return
 
-    state = _load_json(config.PENDING_TASK_STATE_FILE, {})
-    state[str(chat_id)] = {"title": title}
-    _save_json(config.PENDING_TASK_STATE_FILE, state)
-
     keyboard = {
         "inline_keyboard": [
             [{"text": e, "callback_data": f"ntemoji:{e}"} for e in suggestions],
             [{"text": "⏭ Sin emoji", "callback_data": "ntemoji:skip"}, {"text": "❌ Cancelar", "callback_data": "hcancel:0"}],
         ]
     }
-    _telegram_call("sendMessage", chat_id=chat_id, text=f"📝 {title}\n¿Emoji?", reply_markup=keyboard)
+    sent = _telegram_call("sendMessage", chat_id=chat_id, text=f"📝 {title}\n¿Emoji?", reply_markup=keyboard)
+
+    state = _load_json(config.PENDING_TASK_STATE_FILE, {})
+    state[str(chat_id)] = {"title": title, "message_id": sent["message_id"]}
+    _save_json(config.PENDING_TASK_STATE_FILE, state)
 
 
 def _handle_new_task_emoji(callback_id: str, chat_id, message_id, payload: str) -> None:
@@ -78,6 +78,22 @@ def _handle_new_task_emoji(callback_id: str, chat_id, message_id, payload: str) 
     title = pending["title"] if payload == "skip" else f"{payload} {pending['title']}"
     _telegram_call("answerCallbackQuery", callback_query_id=callback_id)
     _show_project_picker(chat_id, title, message_id=message_id)
+
+
+def _handle_new_task_emoji_text(chat_id, text: str, pending: dict) -> None:
+    """A plain-text reply typed while the emoji prompt is showing, instead of
+    pressing one of the suggested-emoji buttons — read for emoji characters
+    of the user's own choosing rather than restarting the new-task flow."""
+    found = emoji_suggest.extract_emojis(text)
+    if not found:
+        _telegram_call(
+            "sendMessage", chat_id=chat_id,
+            text="No encontré ningún emoji en ese mensaje. Elegí uno del teclado o escribí uno.",
+        )
+        return
+
+    title = f"{' '.join(found)} {pending['title']}"
+    _show_project_picker(chat_id, title, message_id=pending.get("message_id"))
 
 
 def _handle_new_task_project(callback_id: str, chat_id, message_id, payload: str) -> None:
