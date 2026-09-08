@@ -47,6 +47,10 @@ def _show_project_picker(chat_id, title: str, message_id=None) -> None:
 
 
 def _start_new_task(chat_id, title: str) -> None:
+    if emoji_suggest.extract_emojis(title):
+        _show_project_picker(chat_id, title)
+        return
+
     suggestions = emoji_suggest.suggest_emojis(title)
     if not suggestions:
         _show_project_picker(chat_id, title)
