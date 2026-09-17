@@ -130,6 +130,45 @@ def _task_local_date(task: dict) -> Optional[date]:
     return dt.astimezone().date()
 
 
+def _recurrence_interval_days(task: dict) -> Optional[int]:
+    """Whole-day repeat interval for a task whose future occurrences are
+    predictable ahead of its current due date. Only repeat_mode 0 ("from
+    due date": next due date is always current due date + repeat_after,
+    regardless of when it's actually marked done) qualifies — repeat_mode 2
+    ("from current date") depends on the actual completion time, so it can't
+    be forecast, and repeat_mode 1 (monthly) isn't a fixed day count.
+    repeat_after is in seconds; only whole-day intervals can be projected
+    onto calendar days."""
+    repeat_after = task.get("repeat_after") or 0
+    if task.get("repeat_mode") != 0 or repeat_after <= 0 or repeat_after % 86400 != 0:
+        return None
+    return repeat_after // 86400
+
+
+def _recurring_projection_dates(task: dict, start: date, end: date) -> list:
+    """Calendar days in [start, end] this task will recur onto after its
+    current due date, assuming it gets marked done on schedule. Vikunja only
+    ever stores a recurring task's current occurrence, so e.g. a task due
+    today that repeats every 2 days wouldn't otherwise show up when looking
+    2 or 4 days ahead. Excludes the current occurrence itself (its actual
+    due date) — callers already pick that up separately."""
+    interval = _recurrence_interval_days(task)
+    base = _task_local_date(task)
+    if interval is None or base is None or start > end:
+        return []
+    offset = (start - base).days
+    first_k = max(1, -(-offset // interval))  # ceil(offset / interval), at least 1
+    dates = []
+    k = first_k
+    while True:
+        d = base + timedelta(days=k * interval)
+        if d > end:
+            break
+        dates.append(d)
+        k += 1
+    return dates
+
+
 def _format_due(task: dict) -> str:
     dt = _task_due_dt(task)
     if dt is None:
@@ -148,12 +187,24 @@ def _next_occurrence_iso(hour: int, minute: int) -> str:
 
 def _tasks_for_date(day: date) -> list:
     """Active tasks due on `day`, sorted by time (day-only tasks first),
-    then by project title to keep same-time ties stable and grouped."""
+    then by project title to keep same-time ties stable and grouped.
+    Also includes tasks not due on `day` themselves but whose fixed repeat
+    interval means they'll have recurred onto `day` by then — see
+    _recurring_projection_dates."""
     tasks: list = _vk_get("/tasks", {"filter": "done = false"})
     result = [t for t in tasks if _task_local_date(t) == day]
+    result += [t for t in tasks if _recurring_projection_dates(t, day, day)]
     project_map = _project_title_map()
+    # Sort by local time-of-day only, not the full due datetime: a projected
+    # recurring occurrence (see _recurring_projection_dates) still carries its
+    # original due date, which would otherwise sort it as if it fell on that
+    # earlier day instead of at its actual time on `day`.
+    def _time_of_day(t: dict) -> dtime:
+        dt = _task_due_dt(t)
+        return dt.astimezone().time() if dt else dtime.min
+
     result.sort(key=lambda t: (
-        _task_due_dt(t) or datetime.min.replace(tzinfo=timezone.utc),
+        _time_of_day(t),
         project_map.get(t.get("project_id"), _INBOX_LABEL),
     ))
     return result
@@ -162,7 +213,9 @@ def _tasks_for_date(day: date) -> list:
 def _tasks_by_date(start: date, days: int) -> dict:
     """Active tasks due within [start, start+days-1], grouped by local
     calendar day. A single /tasks fetch, unlike calling _tasks_for_date once
-    per day."""
+    per day. Each day's list also includes tasks not due that day themselves
+    but whose fixed repeat interval means they'll have recurred onto it by
+    then — see _recurring_projection_dates."""
     end = start + timedelta(days=days - 1)
     tasks: list = _vk_get("/tasks", {"filter": "done = false"})
     by_date: dict = {}
@@ -170,6 +223,8 @@ def _tasks_by_date(start: date, days: int) -> dict:
         d = _task_local_date(t)
         if d is not None and start <= d <= end:
             by_date.setdefault(d, []).append(t)
+        for pd in _recurring_projection_dates(t, start, end):
+            by_date.setdefault(pd, []).append(t)
     return by_date
 
 

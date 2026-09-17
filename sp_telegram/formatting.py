@@ -87,7 +87,17 @@ def _format_day_message(
 
         for t in tasks:
             due_dt = vk._task_due_dt(t)
-            local_dt = due_dt.astimezone().replace(tzinfo=None) if due_dt else None
+            # A projected future occurrence of a recurring task (see
+            # vk._recurring_projection_dates) still carries its *original*
+            # due date, not `day` — combine its time-of-day with `day`
+            # itself so it sorts correctly against same-day tasks/events
+            # instead of by that stale date.
+            if due_dt is None:
+                local_dt = None
+            elif day is not None:
+                local_dt = datetime.combine(day, due_dt.astimezone().time())
+            else:
+                local_dt = due_dt.astimezone().replace(tzinfo=None)
             sort_key = local_dt or datetime.min
             time_str = local_dt.strftime("%H:%M") if local_dt else "──"
             project_title = project_map.get(t.get("project_id"), vk._INBOX_LABEL)
