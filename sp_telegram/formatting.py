@@ -32,6 +32,11 @@ def _task_title_link(task: dict) -> str:
     return f'<a href="{html.escape(url)}">{html.escape(task["title"])}</a>'
 
 
+def _hecho_command(task: dict) -> str:
+    """Tappable `/hecho<id>` command that marks the task done."""
+    return f" /hecho{task['id']}"
+
+
 def _format_day_message(
     tasks: list, label: str, overdue: Optional[list] = None, day: Optional[date] = None,
     events: Optional[list] = None,
@@ -56,7 +61,7 @@ def _format_day_message(
             due_date = vk._task_local_date(t)
             date_str = due_date.strftime("%Y-%m-%d") if due_date else "──"
             project_title = project_map.get(t.get("project_id"), vk._INBOX_LABEL)
-            lines.append(f"⚠️ {date_str}  {vk._priority_prefix(t)}{_task_title_link(t)} · {html.escape(project_title)}{_labels_text(t)}")
+            lines.append(f"⚠️ {date_str}  {vk._priority_prefix(t)}{_task_title_link(t)} · {html.escape(project_title)}{_labels_text(t)}{_hecho_command(t)}")
         lines.append("")
 
     _, free_minutes, elapsed = vk._free_windows_for(day, events) if day is not None else (None, None, False)
@@ -103,7 +108,7 @@ def _format_day_message(
             project_title = project_map.get(t.get("project_id"), vk._INBOX_LABEL)
             entries.append((
                 sort_key,
-                f"🕐 {time_str}  {vk._priority_prefix(t)}{_task_title_link(t)} · {html.escape(project_title)}{_labels_text(t)}",
+                f"🕐 {time_str}  {vk._priority_prefix(t)}{_task_title_link(t)} · {html.escape(project_title)}{_labels_text(t)}{_hecho_command(t)}",
             ))
 
         entries.sort(key=lambda entry: entry[0])
@@ -172,12 +177,13 @@ def _format_load_message(by_date: dict, start: date, days: int, events_by_date: 
         day_tasks = by_date.get(day, [])
         day_events = events_by_date.get(day, [])
         day_label = f"{vk._WEEKDAY_SHORT[day.weekday()]} {day.strftime('%d/%m')}"
+        day_cmd = f"/dia{day.strftime('%Y%m%d')}"
 
         _, free_minutes, elapsed = vk._free_windows_for(day, day_events)
 
         if not day_tasks:
             heat = _load_heat_emoji(0, free_minutes)
-            lines.append(f"{heat} {day_label}: sin tareas")
+            lines.append(f"{heat} {day_label}: sin tareas {day_cmd}")
             continue
 
         window = vk._availability_window_for(day)
@@ -195,7 +201,7 @@ def _format_load_message(by_date: dict, start: date, days: int, events_by_date: 
             summary += f" (+{vk._format_minutes(outside_total)} fuera)"
         if missing:
             summary += f" ⚠️{missing}"
-        lines.append(f"{heat} {day_label}: {summary}")
+        lines.append(f"{heat} {day_label}: {summary} {day_cmd}")
 
     return "\n".join(lines)
 

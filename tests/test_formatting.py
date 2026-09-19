@@ -102,3 +102,19 @@ class TaskPickerKeyboard(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TappableCommands(unittest.TestCase):
+    def test_day_message_lists_hecho_command_per_task(self):
+        tasks = [{"id": 7, "title": "Foo", "project_id": 1}, {"id": 12, "title": "Bar", "project_id": 1}]
+        with patch("sp_telegram.vikunja._real_projects", return_value=[]):
+            msg, _ = formatting._format_day_message(tasks, "hoy")
+        self.assertIn("/hecho7", msg)
+        self.assertIn("/hecho12", msg)
+
+    def test_load_message_lists_dia_command_per_day(self):
+        start = date(2026, 9, 19)
+        with patch("sp_telegram.vikunja._free_windows_for", return_value=(None, None, False)):
+            msg = formatting._format_load_message({}, start, 2)
+        self.assertIn("/dia20260919", msg)
+        self.assertIn("/dia20260920", msg)

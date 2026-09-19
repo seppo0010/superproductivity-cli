@@ -6,7 +6,8 @@ time-entry flow."""
 from __future__ import annotations
 
 import html
-from datetime import date, timedelta
+import re
+from datetime import date, datetime, timedelta
 
 import requests
 
@@ -19,6 +20,31 @@ from .new_task_flow import _handle_new_task_emoji_text, _start_new_task
 from .state import _load_json, _save_json, _state_lock
 from .telegram_api import _telegram_call
 from .time_entry_flow import _handle_time_entry
+
+
+def _handle_hecho_command(chat_id, task_id: int) -> None:
+    """`/hecho<id>`: mark that task done, snapshotting it for undo."""
+    try:
+        task = vk._find_task(task_id)
+        if task is None:
+            _telegram_call("sendMessage", chat_id=chat_id, text="Esa tarea ya no existe.")
+            return
+        vk._vk_task_update(task_id, {"done": True})
+    except requests.RequestException as e:
+        config.log.error("Could not mark task %s done: %s", task_id, e)
+        _telegram_call("sendMessage", chat_id=chat_id, text=f"Error: {e}")
+        return
+
+    with _state_lock:
+        state = _load_json(config.UNDO_STATE_FILE, {})
+        state[str(task_id)] = {"action": "done", "task": task}
+        _save_json(config.UNDO_STATE_FILE, state)
+
+    _telegram_call(
+        "sendMessage", chat_id=chat_id, text=f"✅ {task['title']} — hecha",
+        reply_markup={"inline_keyboard": [[{"text": "↩️ Deshacer", "callback_data": f"undo:{task_id}"}]]},
+    )
+    config.log.info("Marked task %s done via /hecho%s", task_id, task_id)
 
 
 def _handle_message(message: dict) -> None:
@@ -69,6 +95,17 @@ def _handle_message(message: dict) -> None:
         )
         config.log.info("Sent tomorrow's task list (%d task(s)) to chat %s", len(tasks), chat_id)
         return
+
+    # "/dia20260920" — tappable form emitted by /carga (Telegram commands
+    # can't contain spaces or dashes, so the date is glued to the command).
+    dia_match = re.fullmatch(r"/dia(\d{8})", command)
+    if dia_match:
+        try:
+            arg = datetime.strptime(dia_match.group(1), "%Y%m%d").strftime("%Y-%m-%d")
+        except ValueError:
+            _telegram_call("sendMessage", chat_id=chat_id, text="Fecha inválida.")
+            return
+        command = "/dia"
 
     if command in ("/day", "/dia"):
         if not arg:
@@ -345,6 +382,11 @@ def _handle_message(message: dict) -> None:
             "sendMessage", chat_id=chat_id, text=f"✓ Disponibilidad de {label}: {vk._format_time_range(window)}"
         )
         config.log.info("Set availability %s=%s to %s for chat %s", kind, key, window_iso, chat_id)
+        return
+
+    hecho_match = re.fullmatch(r"/hecho(\d+)", command)
+    if hecho_match:
+        _handle_hecho_command(chat_id, int(hecho_match.group(1)))
         return
 
     if command == "/hecho":
