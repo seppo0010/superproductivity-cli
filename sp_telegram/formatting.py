@@ -106,9 +106,15 @@ def _format_day_message(
             sort_key = local_dt or datetime.min
             time_str = local_dt.strftime("%H:%M") if local_dt else "──"
             project_title = project_map.get(t.get("project_id"), vk._INBOX_LABEL)
+            # A projected occurrence isn't a real task instance — Vikunja
+            # can't mark it done ahead of its actual (earlier) occurrence,
+            # so completing it would really just complete that earlier one.
+            # Only offer /hecho on the entry that's genuinely due `day`.
+            is_projected = day is not None and vk._task_local_date(t) != day
+            hecho = "" if is_projected else _hecho_command(t)
             entries.append((
                 sort_key,
-                f"🕐 {time_str}  {vk._priority_prefix(t)}{_task_title_link(t)} · {html.escape(project_title)}{_labels_text(t)}{_hecho_command(t)}",
+                f"🕐 {time_str}  {vk._priority_prefix(t)}{_task_title_link(t)} · {html.escape(project_title)}{_labels_text(t)}{hecho}",
             ))
 
         entries.sort(key=lambda entry: entry[0])

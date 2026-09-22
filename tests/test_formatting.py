@@ -118,3 +118,20 @@ class TappableCommands(unittest.TestCase):
             msg = formatting._format_load_message({}, start, 2)
         self.assertIn("/dia20260919", msg)
         self.assertIn("/dia20260920", msg)
+
+    def test_day_message_omits_hecho_for_projected_recurring_occurrence(self):
+        # Task actually due 2026-09-19, shown on 2026-09-23 only because its
+        # fixed repeat interval projects it there (see
+        # vk._recurring_projection_dates) — marking it done here would really
+        # complete the 2026-09-19 occurrence, not this one, so no /hecho.
+        real_task = {"id": 7, "title": "Real", "project_id": 1, "due_date": "2026-09-19T10:00:00Z"}
+        projected_task = {"id": 8, "title": "Projected", "project_id": 1, "due_date": "2026-09-19T10:00:00Z"}
+        with patch("sp_telegram.vikunja._real_projects", return_value=[]):
+            msg, _ = formatting._format_day_message(
+                [projected_task], "23/09", day=date(2026, 9, 23),
+            )
+            msg_real, _ = formatting._format_day_message(
+                [real_task], "19/09", day=date(2026, 9, 19),
+            )
+        self.assertNotIn("/hecho8", msg)
+        self.assertIn("/hecho7", msg_real)
