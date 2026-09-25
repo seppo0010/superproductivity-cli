@@ -11,6 +11,10 @@ Status comes from Emova's public status page, which is fed by an
 unauthenticated SignalR 2 hub (no documented API; the same channel the page
 itself uses). Emova drops connections from Tor exit nodes, so this is a
 plain direct request.
+
+Events come from the regular 24h calendar cache, so a trip added or tagged
+after the last fetch isn't seen until the cache expires — run
+`/calendario actualizar` after tagging a same-day trip.
 """
 
 from __future__ import annotations
@@ -184,7 +188,7 @@ def check_subte_trips(now: Optional[datetime] = None) -> Optional[int]:
     grace = timedelta(minutes=config.SUBTE_GRACE_MINUTES)
 
     trips = []
-    for e in ical._calendar_events_for_day(today, max_age=config.SUBTE_CALENDAR_MAX_AGE):
+    for e in ical._calendar_events_for_day(today):
         if e["all_day"] or e["start"].date() != today:
             continue
         lines = parse_subte_tag(e.get("description", ""))

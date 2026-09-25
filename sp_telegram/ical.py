@@ -7,7 +7,6 @@ from __future__ import annotations
 import threading
 import time
 from datetime import date, datetime, time as dtime, timedelta
-from typing import Optional
 
 import icalendar
 import recurring_ical_events
@@ -56,20 +55,16 @@ def _declined_by(component, emails: list) -> bool:
     return False
 
 
-def _fetch_calendar(url: str, max_age: Optional[int] = None) -> "icalendar.Calendar":
+def _fetch_calendar(url: str) -> "icalendar.Calendar":
     """Fetches and parses a calendar feed, caching the *parsed* result for
     GOOGLE_CALENDAR_CACHE_SECONDS. Google's private iCal export includes a
     calendar's entire history, so re-parsing the feed text (not just
     re-fetching it over the network) on every command was the real cost —
-    caching only the raw bytes still left that parse on the hot path.
-    `max_age` (seconds) overrides that TTL for callers that need fresher
-    data, like the subte check, which must see a trip added earlier today."""
-    if max_age is None:
-        max_age = config.GOOGLE_CALENDAR_CACHE_SECONDS
+    caching only the raw bytes still left that parse on the hot path."""
     now = time.time()
     with _ics_cache_lock:
         cached = _ics_cache.get(url)
-        if cached and now - cached[0] < max_age:
+        if cached and now - cached[0] < config.GOOGLE_CALENDAR_CACHE_SECONDS:
             return cached[1]
     resp = requests.get(url, timeout=15)
     resp.raise_for_status()
@@ -84,7 +79,7 @@ def _clear_ics_cache() -> None:
         _ics_cache.clear()
 
 
-def _calendar_events_for_range(start: date, end: date, max_age: Optional[int] = None) -> list:
+def _calendar_events_for_range(start: date, end: date) -> list:
     """Events overlapping [start, end) across all configured calendars,
     normalized to local wall-clock datetimes and sorted by start time. Skips
     (and logs) any calendar whose feed can't be fetched/parsed rather than
@@ -93,7 +88,7 @@ def _calendar_events_for_range(start: date, end: date, max_age: Optional[int] = 
     emails = _calendar_emails()
     for url in _calendar_urls():
         try:
-            cal = _fetch_calendar(url, max_age)
+            cal = _fetch_calendar(url)
             occurrences = recurring_ical_events.of(cal).between(start, end)
         except Exception as e:
             config.log.warning("Could not fetch/parse calendar %s: %s", url, e)
@@ -125,8 +120,8 @@ def _calendar_events_for_range(start: date, end: date, max_age: Optional[int] = 
     return events
 
 
-def _calendar_events_for_day(day: date, max_age: Optional[int] = None) -> list:
-    return _calendar_events_for_range(day, day + timedelta(days=1), max_age)
+def _calendar_events_for_day(day: date) -> list:
+    return _calendar_events_for_range(day, day + timedelta(days=1))
 
 
 def _calendar_events_by_date(start: date, days: int) -> dict:

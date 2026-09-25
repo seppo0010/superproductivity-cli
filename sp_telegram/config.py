@@ -36,7 +36,6 @@ DAILY_DIGEST_HOUR = 6
 SUBTE_STATE_FILE = STATE_DIR / "subte_state.json"
 SUBTE_PRE_MINUTES = 30  # first check (alert only on problems) this long before the event starts
 SUBTE_GRACE_MINUTES = 15  # skip the departure check if the daemon wakes up later than this past start
-SUBTE_CALENDAR_MAX_AGE = int(os.environ.get("SUBTE_CALENDAR_MAX_AGE", str(30 * 60)))
 
 TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
