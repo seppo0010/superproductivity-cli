@@ -24,6 +24,11 @@ Telegram poll loop, reconciliation loop) and validates required env vars.
   (occupancy schedule) config and free-time calculation.
 - `ical.py` — fetches/parses configured iCal feeds (commonly a Google Calendar secret address, but
   any iCal feed works) and expands recurring events; caches parsed calendars in memory.
+- `subte.py` — subte status check for trips: calendar events with a `subte: D` (or `subte: D, C`)
+  line in their description get a line-status check SUBTE_PRE_MINUTES (30) before start (message only
+  on problems) and again at start (always messages). Status comes from Emova's public SignalR feed
+  (the one behind its status web page; no auth, no documented API). Direct request only — Emova drops
+  Tor exits. Calendar is re-read with a 30-min `max_age` so trips added the same day are seen.
 - `emoji_suggest.py` — `suggest_emojis(title)`: best-effort emoji suggestions for a new task title,
   used by `new_task_flow.py`. A small hand-written Spanish task-verb overlay, backed by a much larger
   automatic reverse index built at import time from the `emoji` package's Spanish CLDR names.

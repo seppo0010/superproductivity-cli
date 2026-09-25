@@ -31,6 +31,13 @@ needed. Events count toward the day's occupancy window unless marked Free
 in memory for GOOGLE_CALENDAR_CACHE_SECONDS (default 24h, since calendars
 don't change often); /calendario actualizar flushes that cache on demand.
 
+Subte trips: a calendar event with a `subte: D` line (or `subte: D, C`) in
+its description is a trip by subte whose start time is when you leave.
+SUBTE_PRE_MINUTES (30) before, the line status is checked on Emova's public
+status feed and you're alerted only if there's a problem; at the start time
+it's rechecked and a "no delays" or problem message is always sent (see
+sp_telegram/subte.py).
+
 Implementation is split across the sp_telegram package (config, state,
 vikunja, ical, formatting, telegram_api, notify, and the flow/command
 modules) — this file just wires the threads together.
@@ -47,6 +54,7 @@ import requests
 from sp_telegram import config
 from sp_telegram.notify import _run_webhook_server, check_daily_digest, check_due_tasks
 from sp_telegram.poll import poll_telegram_updates
+from sp_telegram.subte import check_subte_trips
 from sp_telegram.telegram_api import _telegram_call
 
 
@@ -87,9 +95,15 @@ def main() -> None:
     while True:
         next_due_in = check_due_tasks()
         check_daily_digest()
+        try:
+            next_subte_in = check_subte_trips()
+        except Exception as e:
+            config.log.exception("Subte check failed: %s", e)
+            next_subte_in = None
         sleep_seconds = config.CHECK_INTERVAL_SECONDS
-        if next_due_in is not None:
-            sleep_seconds = min(config.CHECK_INTERVAL_SECONDS, next_due_in)
+        for wake_in in (next_due_in, next_subte_in):
+            if wake_in is not None:
+                sleep_seconds = min(sleep_seconds, wake_in)
         time.sleep(sleep_seconds)
 
 
