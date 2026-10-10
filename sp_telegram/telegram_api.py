@@ -16,6 +16,10 @@ def _telegram_call(method: str, **params) -> object:
     # JSON null with a 400 — callers that pass through a possibly-None value
     # (like _reply_to_pending) must have that treated as "omitted".
     params = {k: v for k, v in params.items() if v is not None}
+    # Task titles/lists often contain URLs; never let Telegram expand them
+    # into a link preview card.
+    if method in ("sendMessage", "editMessageText"):
+        params.setdefault("link_preview_options", {"is_disabled": True})
     url = config.TELEGRAM_API.format(token=config.TOKEN, method=method)
     r = requests.post(url, json=params, timeout=35)
     r.raise_for_status()
