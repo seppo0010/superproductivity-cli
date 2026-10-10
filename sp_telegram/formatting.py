@@ -4,6 +4,7 @@ inline keyboards."""
 from __future__ import annotations
 
 import html
+import re
 from datetime import date, datetime, timedelta
 from typing import Optional
 
@@ -27,9 +28,42 @@ def _labels_text(task: dict) -> str:
     return f" · 🏷 {html.escape(', '.join(titles))}" if titles else ""
 
 
+_URL_RE = re.compile(r"https?://\S+")
+# Punctuation that usually ends the surrounding sentence rather than the URL.
+_URL_TRAILING_PUNCT = ".,;:!?)]}'\""
+
+
 def _task_title_link(task: dict) -> str:
-    url = f"{config.VIKUNJA_URL}/tasks/{task['id']}"
-    return f'<a href="{html.escape(url)}">{html.escape(task["title"])}</a>'
+    """Title linked to the task in Vikunja. Any URLs inside the title get
+    their own link to the URL itself instead, so tapping them opens the URL
+    rather than the task. If the title is nothing but URLs, a trailing 📋
+    link to the task is added so it's still reachable."""
+    task_url = html.escape(f"{config.VIKUNJA_URL}/tasks/{task['id']}")
+    title = task["title"]
+    parts = []
+    has_text = False
+    pos = 0
+
+    def add_text(text: str) -> None:
+        nonlocal has_text
+        if not text:
+            return
+        if text.strip():
+            has_text = True
+            parts.append(f'<a href="{task_url}">{html.escape(text)}</a>')
+        else:
+            parts.append(html.escape(text))
+
+    for m in _URL_RE.finditer(title):
+        url = m.group(0).rstrip(_URL_TRAILING_PUNCT)
+        add_text(title[pos:m.start()])
+        parts.append(f'<a href="{html.escape(url)}">{html.escape(url)}</a>')
+        pos = m.start() + len(url)
+    add_text(title[pos:])
+
+    if not has_text:
+        parts.append(f' <a href="{task_url}">📋</a>')
+    return "".join(parts)
 
 
 def _hecho_command(task: dict) -> str:

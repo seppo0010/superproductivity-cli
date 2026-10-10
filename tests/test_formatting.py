@@ -49,6 +49,21 @@ class TaskTitleLink(unittest.TestCase):
         self.assertIn("/tasks/42", link)
         self.assertIn("&lt;b&gt;urgent&lt;/b&gt;", link)
 
+    def test_url_in_title_links_to_itself(self):
+        task = {"id": 42, "title": "Leer https://example.com/a?x=1&y=2."}
+        link = formatting._task_title_link(task)
+        self.assertIn('/tasks/42">Leer </a>', link)
+        self.assertIn(
+            '<a href="https://example.com/a?x=1&amp;y=2">https://example.com/a?x=1&amp;y=2</a>', link
+        )
+        self.assertTrue(link.endswith('/tasks/42">.</a>'))
+
+    def test_url_only_title_keeps_task_link(self):
+        task = {"id": 42, "title": "https://example.com"}
+        link = formatting._task_title_link(task)
+        self.assertIn('<a href="https://example.com">https://example.com</a>', link)
+        self.assertIn('/tasks/42">📋</a>', link)
+
 
 class FormatDayMessageEmpty(unittest.TestCase):
     def test_nothing_pending(self):
