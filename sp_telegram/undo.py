@@ -51,8 +51,11 @@ def _handle_undo(callback_id: str, chat_id, message_id, payload: str) -> None:
             vk._vk_task_update(prev_task["id"], {"priority": prev_task.get("priority") or 0})
             result_text = f"↩️ {prev_task['title']} — deshecho"
         else:
-            # done/snooze* only ever touch these two fields, so restoring
-            # both from the pre-action snapshot reverses any of them.
+            # done/snooze*/punt only ever touch these two fields, so restoring
+            # both from the pre-action snapshot reverses any of them — plus,
+            # when postponing forked a recurring task, deleting the copy.
+            if entry.get("fork_id"):
+                vk._vk_delete(f"/tasks/{entry['fork_id']}")
             vk._vk_task_update(prev_task["id"], {
                 "done": prev_task.get("done", False),
                 "due_date": prev_task.get("due_date") or "",

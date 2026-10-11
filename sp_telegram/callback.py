@@ -19,7 +19,7 @@ from .estimate_priority_flow import (
     _handle_priority_set,
 )
 from .new_task_flow import _handle_new_task_due, _handle_new_task_emoji, _handle_new_task_project
-from .punt_flow import _handle_punt_due, _handle_punt_pick
+from .punt_flow import _FORK_NOTE, _handle_punt_due, _handle_punt_pick
 from .state import _load_json, _save_json, _state_lock
 from .telegram_api import _telegram_call
 from .undo import _handle_undo
@@ -106,6 +106,7 @@ def _handle_callback(callback: dict) -> None:
         )
         return
 
+    fork = None
     try:
         if action == "done":
             vk._vk_task_update(task_id, {"done": True})
@@ -120,10 +121,10 @@ def _handle_callback(callback: dict) -> None:
                 "snooze1440": timedelta(hours=24),
             }[action]
             new_dt = datetime.now(timezone.utc) + delta
-            vk._vk_task_update(task_id, {"due_date": new_dt.strftime("%Y-%m-%dT%H:%M:%SZ")})
+            fork = vk._postpone_task(task, new_dt.strftime("%Y-%m-%dT%H:%M:%SZ"))
             result_text = f"⏰ {task['title']} — pospuesta a las {new_dt.astimezone().strftime('%Y-%m-%d %H:%M')}"
         elif action == "snoozeday":
-            vk._vk_task_update(task_id, {"due_date": vk._day_to_due_iso(date.today())})
+            fork = vk._postpone_task(task, vk._day_to_due_iso(date.today()))
             result_text = f"⏰ {task['title']} — pospuesta a hoy, sin hora fija"
         elif action == "tarjeta":
             label_obj = vk._find_label_by_title(vk._TARJETA_LABEL_TITLE)
@@ -149,9 +150,14 @@ def _handle_callback(callback: dict) -> None:
 
     with _state_lock:
         state = _load_json(config.UNDO_STATE_FILE, {})
-        state[str(task_id)] = {"action": action, "task": task}
+        entry = {"action": action, "task": task}
+        if fork is not None:
+            entry["fork_id"] = fork["id"]
+        state[str(task_id)] = entry
         _save_json(config.UNDO_STATE_FILE, state)
 
+    if fork is not None:
+        result_text += _FORK_NOTE
     try:
         _telegram_call(
             "editMessageText", chat_id=chat_id, message_id=message_id, text=result_text,

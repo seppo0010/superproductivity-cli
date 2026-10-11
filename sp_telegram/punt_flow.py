@@ -61,16 +61,24 @@ def _handle_punt_pick(callback_id: str, chat_id, message_id, payload: str) -> No
     _telegram_call("answerCallbackQuery", callback_query_id=callback_id)
 
 
+# Appended to the confirmation when postponing forked a recurring task
+# (see vk._postpone_task).
+_FORK_NOTE = "\n🔁 Copia de esta vez; la recurrente sigue en su próxima fecha"
+
+
 def _apply_punt(task: dict, task_id: int, due_date_iso: str, due_label: str) -> str:
     """Applies a new due date to `task` (fetched pre-change, for the undo
     snapshot) and returns the confirmation text. Raises RequestException."""
-    vk._vk_task_update(task_id, {"due_date": due_date_iso})
+    fork = vk._postpone_task(task, due_date_iso)
+    entry = {"action": "punt", "task": task}
+    if fork is not None:
+        entry["fork_id"] = fork["id"]
     with _state_lock:
         state = _load_json(config.UNDO_STATE_FILE, {})
-        state[str(task_id)] = {"action": "punt", "task": task}
+        state[str(task_id)] = entry
         _save_json(config.UNDO_STATE_FILE, state)
-    config.log.info("Punted task %s to %s", task_id, due_label)
-    return f"📅 {task['title']} — pospuesta a {due_label}"
+    config.log.info("Punted task %s to %s%s", task_id, due_label, f" (fork {fork['id']})" if fork else "")
+    return f"📅 {task['title']} — pospuesta a {due_label}{_FORK_NOTE if fork else ''}"
 
 
 def _handle_punt_due(callback_id: str, chat_id, message_id, payload: str) -> None:

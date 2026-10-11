@@ -169,6 +169,83 @@ def _recurring_projection_dates(task: dict, start: date, end: date) -> list:
     return dates
 
 
+def _is_recurring(task: dict) -> bool:
+    """repeat_mode 1 (monthly) recurs with repeat_after = 0; the other modes
+    only recur when repeat_after is set."""
+    return task.get("repeat_mode") == 1 or (task.get("repeat_after") or 0) > 0
+
+
+def _add_months(dt: datetime, months: int) -> datetime:
+    """Same local day-of-month and time, `months` later; clamped to the last
+    day of a shorter month (Jan 31 + 1 → Feb 28/29)."""
+    local = dt.astimezone()
+    idx = local.month - 1 + months
+    year, month = local.year + idx // 12, idx % 12 + 1
+    next_month_first = date(year + month // 12, month % 12 + 1, 1)
+    day = min(local.day, (next_month_first - timedelta(days=1)).day)
+    return local.replace(year=year, month=month, day=day).astimezone(timezone.utc)
+
+
+def _next_occurrence_dt(task: dict, now: Optional[datetime] = None) -> Optional[datetime]:
+    """When a recurring task's next occurrence falls, by its own schedule —
+    the date Vikunja would move it to when marked done. For the fixed-schedule
+    modes (0 "from due date", 1 monthly) that's the first slot on the
+    schedule after both the current due date and `now`, so an overdue task
+    skips the occurrences already missed. For mode 2 ("from current date")
+    it's `now` + repeat_after; with a whole-day interval the due time of day
+    is kept (including the 23:59 "no specific time" sentinel). None if the
+    task has no due date to step from."""
+    due = _parse_vikunja_ts(task.get("due_date", ""))
+    if due is None:
+        return None
+    now = now or datetime.now(timezone.utc)
+    repeat_after = task.get("repeat_after") or 0
+    mode = task.get("repeat_mode")
+    if mode == 2:
+        if repeat_after % 86400 == 0:
+            local_due = due.astimezone()
+            day = now.astimezone().date() + timedelta(days=repeat_after // 86400)
+            return datetime.combine(day, local_due.timetz()).astimezone(timezone.utc)
+        return now + timedelta(seconds=repeat_after)
+    if mode == 1:
+        months = 1
+        nxt = _add_months(due, months)
+        while nxt <= now:
+            months += 1
+            nxt = _add_months(due, months)
+        return nxt
+    nxt = due + timedelta(seconds=repeat_after)
+    while nxt <= now:
+        nxt += timedelta(seconds=repeat_after)
+    return nxt
+
+
+def _postpone_task(task: dict, due_date_iso: str) -> Optional[dict]:
+    """Moves `task` to `due_date_iso`. A recurring task is "forked" instead,
+    so postponing never changes its schedule (that's only edited in Vikunja
+    itself): a one-off copy takes the new due date, and the original is
+    rescheduled to its next occurrence (see _next_occurrence_dt) — not marked
+    done, so no completion gets recorded. Returns the copy for a fork, else
+    None. Raises RequestException."""
+    if not _is_recurring(task):
+        _vk_task_update(task["id"], {"due_date": due_date_iso})
+        return None
+    body = {
+        "title": task["title"],
+        "description": task.get("description") or "",
+        "due_date": due_date_iso,
+        "priority": task.get("priority") or 0,
+        "hex_color": task.get("hex_color") or "",
+    }
+    created = _vk_put(f"/projects/{task['project_id']}/tasks", body)
+    for label in task.get("labels") or []:
+        _vk_put(f"/tasks/{created['id']}/labels", {"label_id": label["id"]})
+    nxt = _next_occurrence_dt(task)
+    if nxt is not None:
+        _vk_task_update(task["id"], {"due_date": nxt.strftime("%Y-%m-%dT%H:%M:%SZ")})
+    return created
+
+
 def _format_due(task: dict) -> str:
     dt = _task_due_dt(task)
     if dt is None:

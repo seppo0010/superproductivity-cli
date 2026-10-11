@@ -56,6 +56,12 @@ Telegram poll loop, reconciliation loop) and validates required env vars.
   a "↩️ Deshacer" button. `undo.py` reads the snapshot back and knows how to reverse each action kind.
 - **`_state_lock`** must wrap any read-modify-write of a state JSON file that more than one thread
   can touch (webhook thread, poll thread, main reconciliation loop) — see existing call sites for the pattern.
+- **Postponing never changes a recurring task's schedule** (that's only edited in Vikunja itself).
+  Every postpone path (punt flow, typed date/time, snooze buttons) goes through `vk._postpone_task`:
+  a recurring task is forked into a one-off copy with the new due date, and the original's due date
+  is moved to its next occurrence (`vk._next_occurrence_dt`) — never marked done, so no completion
+  is recorded. The undo snapshot then carries `fork_id`, and undo deletes the copy before restoring
+  the original's `due_date`.
 - Vikunja's task update PATCH resets any field omitted from the body, so `_vk_task_update` always
   does fetch-merge-write, never a naive partial update.
 - **New-task emoji prefix**: `new_task_flow._start_new_task` inserts an emoji-pick step (skipped if

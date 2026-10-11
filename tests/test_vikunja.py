@@ -1,5 +1,5 @@
 import unittest
-from datetime import date, datetime, time as dtime, timezone
+from datetime import date, datetime, time as dtime, timedelta, timezone
 from unittest.mock import patch
 
 from sp_telegram import vikunja as vk
@@ -262,3 +262,80 @@ class SplitEstimatesByWindow(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class PostponeTask(unittest.TestCase):
+    NEW_DUE = "2026-08-22T15:00:00Z"
+
+    def _task(self, **kw):
+        task = {
+            "id": 7, "project_id": 3, "title": "Regar plantas", "description": "",
+            "due_date": "2026-08-21T12:00:00Z", "priority": 2, "repeat_after": 0, "repeat_mode": 0,
+            "labels": [{"id": 11}],
+        }
+        task.update(kw)
+        return task
+
+    def test_one_off_task_just_moves(self):
+        with patch.object(vk, "_vk_task_update") as update, patch.object(vk, "_vk_put") as put:
+            self.assertIsNone(vk._postpone_task(self._task(), self.NEW_DUE))
+        update.assert_called_once_with(7, {"due_date": self.NEW_DUE})
+        put.assert_not_called()
+
+    def _assert_forks(self, task):
+        with patch.object(vk, "_vk_task_update") as update, \
+                patch.object(vk, "_vk_put", side_effect=[{"id": 99}, {}]) as put:
+            fork = vk._postpone_task(task, self.NEW_DUE)
+        self.assertEqual(fork, {"id": 99})
+        path, body = put.call_args_list[0].args
+        self.assertEqual(path, "/projects/3/tasks")
+        self.assertEqual(body["due_date"], self.NEW_DUE)
+        self.assertEqual(body["title"], "Regar plantas")
+        self.assertNotIn("repeat_after", body)
+        put.assert_any_call("/tasks/99/labels", {"label_id": 11})
+        # The original only gets rescheduled, never marked done.
+        update.assert_called_once()
+        task_id, changes = update.call_args.args
+        self.assertEqual(task_id, 7)
+        self.assertEqual(list(changes), ["due_date"])
+
+    def test_recurring_task_forks(self):
+        self._assert_forks(self._task(repeat_after=86400))
+
+    def test_monthly_task_forks(self):
+        self._assert_forks(self._task(repeat_mode=1))
+
+
+class NextOccurrence(unittest.TestCase):
+    NOW = datetime(2026, 8, 21, 18, 0, tzinfo=timezone.utc)
+
+    def _next(self, due, **kw):
+        return vk._next_occurrence_dt({"due_date": due, **kw}, now=self.NOW)
+
+    def test_from_due_date_one_step(self):
+        self.assertEqual(
+            self._next("2026-08-21T20:00:00Z", repeat_mode=0, repeat_after=86400),
+            datetime(2026, 8, 22, 20, 0, tzinfo=timezone.utc),
+        )
+
+    def test_from_due_date_skips_missed_occurrences(self):
+        self.assertEqual(
+            self._next("2026-08-18T12:00:00Z", repeat_mode=0, repeat_after=86400),
+            datetime(2026, 8, 22, 12, 0, tzinfo=timezone.utc),
+        )
+
+    def test_monthly_clamps_short_month(self):
+        due = vk._local_time_to_iso(date(2026, 8, 31), 9, 0)
+        nxt = self._next(due, repeat_mode=1, repeat_after=0)
+        self.assertEqual(nxt.astimezone().date(), date(2026, 9, 30))
+        self.assertEqual(nxt.astimezone().strftime("%H:%M"), "09:00")
+
+    def test_from_current_date_keeps_no_time_sentinel(self):
+        due = vk._day_to_due_iso(date(2026, 8, 19))
+        nxt = self._next(due, repeat_mode=2, repeat_after=2 * 86400)
+        task = {"due_date": nxt.strftime("%Y-%m-%dT%H:%M:%SZ")}
+        self.assertIsNone(vk._task_due_dt(task))
+        self.assertEqual(vk._task_local_date(task), self.NOW.astimezone().date() + timedelta(days=2))
+
+    def test_no_due_date(self):
+        self.assertIsNone(self._next("", repeat_mode=0, repeat_after=86400))
