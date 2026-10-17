@@ -8,6 +8,7 @@ from __future__ import annotations
 import html
 import re
 from datetime import date, datetime, timedelta
+from typing import Optional
 
 import requests
 
@@ -22,12 +23,36 @@ from .telegram_api import _telegram_call
 from .time_entry_flow import _handle_time_entry
 
 
-def _handle_hecho_command(chat_id, task_id: int) -> None:
-    """`/hecho<id>`: mark that task done, snapshotting it for undo."""
+def _handle_hecho_command(chat_id, task_id: int, occurrence: Optional[date] = None) -> None:
+    """`/hecho<id>[_<YYYYMMDD>]`: mark that task done, snapshotting it for
+    undo. For a recurring task the occurrence date is required and must
+    match its current due date: marking it done just advances the due date
+    in place, so without this check a repeated tap would silently complete
+    the next occurrence too. See formatting._hecho_command."""
     try:
         task = vk._find_task(task_id)
         if task is None:
             _telegram_call("sendMessage", chat_id=chat_id, text="Esa tarea ya no existe.")
+            return
+        if vk._is_recurring(task):
+            current = vk._task_local_date(task)
+            if occurrence is None and current is not None:
+                _telegram_call(
+                    "sendMessage", chat_id=chat_id,
+                    text=f"🔁 {task['title']} es recurrente — la ocurrencia pendiente vence el "
+                         f"{current.strftime('%d/%m/%Y')}. Para marcarla: /hecho{task_id}_{current.strftime('%Y%m%d')}",
+                )
+                return
+            if occurrence is not None and occurrence != current:
+                next_str = current.strftime("%d/%m/%Y") if current else "sin fecha"
+                _telegram_call(
+                    "sendMessage", chat_id=chat_id,
+                    text=f"⚠️ La ocurrencia del {occurrence.strftime('%d/%m/%Y')} de {task['title']} "
+                         f"ya no está pendiente (la próxima vence el {next_str}). No cambié nada.",
+                )
+                return
+        elif task.get("done"):
+            _telegram_call("sendMessage", chat_id=chat_id, text=f"{task['title']} ya estaba hecha.")
             return
         vk._vk_task_update(task_id, {"done": True})
     except requests.RequestException as e:
@@ -384,9 +409,16 @@ def _handle_message(message: dict) -> None:
         config.log.info("Set availability %s=%s to %s for chat %s", kind, key, window_iso, chat_id)
         return
 
-    hecho_match = re.fullmatch(r"/hecho(\d+)", command)
+    hecho_match = re.fullmatch(r"/hecho(\d+)(?:_(\d{8}))?", command)
     if hecho_match:
-        _handle_hecho_command(chat_id, int(hecho_match.group(1)))
+        occurrence = None
+        if hecho_match.group(2):
+            try:
+                occurrence = datetime.strptime(hecho_match.group(2), "%Y%m%d").date()
+            except ValueError:
+                _telegram_call("sendMessage", chat_id=chat_id, text="Fecha inválida.")
+                return
+        _handle_hecho_command(chat_id, int(hecho_match.group(1)), occurrence)
         return
 
     if command == "/hecho":

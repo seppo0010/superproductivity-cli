@@ -67,7 +67,14 @@ def _task_title_link(task: dict) -> str:
 
 
 def _hecho_command(task: dict) -> str:
-    """Tappable `/hecho<id>` command that marks the task done."""
+    """Tappable `/hecho<id>` command that marks the task done. Recurring
+    tasks get the occurrence's local due date appended
+    (`/hecho<id>_<YYYYMMDD>`) so tapping the same command twice can't
+    silently complete two occurrences — the second tap no longer matches
+    the (already advanced) due date and is rejected."""
+    day = vk._task_local_date(task) if vk._is_recurring(task) else None
+    if day is not None:
+        return f" /hecho{task['id']}_{day.strftime('%Y%m%d')}"
     return f" /hecho{task['id']}"
 
 

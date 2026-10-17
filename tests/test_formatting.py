@@ -150,3 +150,47 @@ class TappableCommands(unittest.TestCase):
             )
         self.assertNotIn("/hecho8", msg)
         self.assertIn("/hecho7", msg_real)
+
+
+class HechoOccurrenceGuard(unittest.TestCase):
+    """Recurring tasks carry the occurrence date in /hecho so a repeated
+    tap can't complete the next occurrence too."""
+
+    RECURRING = {"id": 7, "title": "Regar", "project_id": 1, "repeat_after": 86400, "repeat_mode": 0,
+                 "due_date": "2026-10-17T13:00:00Z"}
+
+    def test_recurring_command_includes_occurrence_date(self):
+        self.assertEqual(formatting._hecho_command(self.RECURRING), " /hecho7_20261017")
+
+    def test_one_off_command_has_no_date(self):
+        task = {"id": 9, "title": "Foo", "due_date": "2026-10-17T13:00:00Z"}
+        self.assertEqual(formatting._hecho_command(task), " /hecho9")
+
+    def _run(self, text, task):
+        from sp_telegram import commands, config
+        with patch("sp_telegram.vikunja._find_task", return_value=task), \
+             patch("sp_telegram.vikunja._vk_task_update") as upd, \
+             patch("sp_telegram.commands._telegram_call") as tg, \
+             patch("sp_telegram.commands._save_json"), \
+             patch("sp_telegram.commands._load_json", return_value={}):
+            commands._handle_message({"chat": {"id": config.CHAT_ID}, "text": text})
+        return upd, tg
+
+    def test_matching_occurrence_marks_done(self):
+        upd, _ = self._run("/hecho7_20261017", self.RECURRING)
+        upd.assert_called_once_with(7, {"done": True})
+
+    def test_stale_occurrence_is_rejected(self):
+        advanced = dict(self.RECURRING, due_date="2026-10-18T13:00:00Z")
+        upd, tg = self._run("/hecho7_20261017", advanced)
+        upd.assert_not_called()
+        self.assertIn("ya no está pendiente", tg.call_args.kwargs["text"])
+
+    def test_bare_command_on_recurring_asks_for_confirmation(self):
+        upd, tg = self._run("/hecho7", self.RECURRING)
+        upd.assert_not_called()
+        self.assertIn("/hecho7_20261017", tg.call_args.kwargs["text"])
+
+    def test_already_done_one_off_is_not_touched(self):
+        upd, _ = self._run("/hecho9", {"id": 9, "title": "Foo", "done": True})
+        upd.assert_not_called()
