@@ -28,7 +28,7 @@ Calendar → calendar settings → "Integrate calendar" → "Secret address in
 iCal format") via the /calendario agregar <url> bot command — no env var
 needed. Events count toward the day's occupancy window unless marked Free
 (the Busy/Free toggle on the event) or all-day. Fetched feeds are cached
-in memory for GOOGLE_CALENDAR_CACHE_SECONDS (default 24h, since calendars
+in memory for GOOGLE_CALENDAR_CACHE_SECONDS (default 4h, since calendars
 don't change often); /calendario actualizar flushes that cache on demand.
 
 Subte trips: a calendar event with a `subte: D` line (or `subte: D, C`) in

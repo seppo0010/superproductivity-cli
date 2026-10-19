@@ -12,7 +12,7 @@ unauthenticated SignalR 2 hub (no documented API; the same channel the page
 itself uses). Emova drops connections from Tor exit nodes, so this is a
 plain direct request.
 
-Events come from the regular 24h calendar cache, so a trip added or tagged
+Events come from the regular 4h calendar cache, so a trip added or tagged
 after the last fetch isn't seen until the cache expires — run
 `/calendario actualizar` after tagging a same-day trip.
 """

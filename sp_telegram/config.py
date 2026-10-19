@@ -29,7 +29,7 @@ PENDING_ESTIMATE_STATE_FILE = STATE_DIR / "pending_estimate_state.json"
 UNDO_STATE_FILE = STATE_DIR / "undo_state.json"
 AVAILABILITY_STATE_FILE = STATE_DIR / "availability.json"
 GOOGLE_CALENDAR_STATE_FILE = STATE_DIR / "calendars.json"
-GOOGLE_CALENDAR_CACHE_SECONDS = int(os.environ.get("GOOGLE_CALENDAR_CACHE_SECONDS", str(24 * 60 * 60)))
+GOOGLE_CALENDAR_CACHE_SECONDS = int(os.environ.get("GOOGLE_CALENDAR_CACHE_SECONDS", str(4 * 60 * 60)))
 DAILY_DIGEST_HOUR = 6
 
 # Subte status check for calendar events tagged "subte: D" in their description
