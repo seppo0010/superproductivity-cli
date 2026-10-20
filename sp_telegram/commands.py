@@ -1,6 +1,6 @@
 """Slash-command handling: /hoy, /mañana, /day, /carga, /calendario,
 /disponibilidad, /hecho, /borrar, /tarjeta, /estimar, /sinestimar, /prioridad,
-/punt, and the plain-message fallback that starts the new-task or
+/punt, /subte, and the plain-message fallback that starts the new-task or
 time-entry flow."""
 
 from __future__ import annotations
@@ -15,6 +15,7 @@ import requests
 from . import config
 from . import formatting
 from . import ical
+from . import subte
 from . import vikunja as vk
 from .estimate_priority_flow import _handle_estimate_text
 from .new_task_flow import _handle_new_task_emoji_text, _start_new_task
@@ -558,6 +559,21 @@ def _handle_message(message: dict) -> None:
             ),
         )
         config.log.info("Sent /punt task picker (%d task(s)) to chat %s", len(tasks), chat_id)
+        return
+
+    if command == "/subte":
+        lines = [subte._normalize_line(p) for p in re.split(r"[,\s]+", arg) if p]
+        try:
+            statuses = subte.fetch_line_statuses()
+        except (requests.RequestException, ValueError) as e:
+            config.log.error("Could not fetch subte status from Emova: %s", e)
+            _telegram_call("sendMessage", chat_id=chat_id, text=f"⚠️ No pude verificar el estado del subte: {e}")
+            return
+
+        _telegram_call(
+            "sendMessage", chat_id=chat_id, text=subte.format_status_report(statuses, lines), parse_mode="HTML",
+        )
+        config.log.info("Sent subte status to chat %s", chat_id)
         return
 
     if text.startswith("/"):

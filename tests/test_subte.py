@@ -75,6 +75,15 @@ class Classify(unittest.TestCase):
     def test_strike(self):
         self.assertEqual(subte.classify("Sin servicio por paro"), "problem")
 
+    def test_recovering_frequency_is_ok(self):
+        self.assertEqual(subte.classify(
+            "Presta su servicio completo entre cabeceras normalizando su frecuencia habitual"), "ok")
+
+    def test_degraded_frequency(self):
+        self.assertEqual(subte.classify("Funciona con frecuencia irregular"), "problem")
+        self.assertEqual(subte.classify("Servicio con baja frecuencia"), "problem")
+        self.assertEqual(subte.classify("Funciona con frecuencia reducida"), "problem")
+
     def test_informational_note(self):
         self.assertEqual(subte.classify("Estación Medrano cerrada por obras."), "ok")
 
@@ -85,6 +94,22 @@ class Classify(unittest.TestCase):
 def _event(start, description="subte: D"):
     return {"title": "Travel to Derecho", "start": start, "end": start, "all_day": False,
             "busy": True, "description": description, "uid": "abc"}
+
+
+class FormatStatusReport(unittest.TestCase):
+    STATUSES = {"A": "Normal", "B": "Estación Medrano cerrada por obras.", "D": "Demoras en el servicio"}
+
+    def test_all_lines(self):
+        text = subte.format_status_report(self.STATUSES)
+        self.assertIn("✅ <b>A</b>: Normal", text)
+        self.assertIn("ℹ️ <b>B</b>", text)
+        self.assertIn("🚨 <b>D</b>: Demoras", text)
+
+    def test_selected_lines_and_unknown(self):
+        text = subte.format_status_report(self.STATUSES, ["D", "H"])
+        self.assertNotIn("<b>A</b>", text)
+        self.assertIn("🚨 <b>D</b>", text)
+        self.assertIn("🚨 <b>H</b>: sin información", text)
 
 
 class CheckSubteTrips(unittest.TestCase):

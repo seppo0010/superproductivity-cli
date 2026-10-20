@@ -29,7 +29,8 @@ Telegram poll loop, reconciliation loop) and validates required env vars.
   on problems) and again at start (always messages). Status comes from Emova's public SignalR feed
   (the one behind its status web page; no auth, no documented API). Direct request only — Emova drops
   Tor exits. Uses the regular 4h calendar cache, so a trip tagged the same day needs
-  `/calendario actualizar` to be seen.
+  `/calendario actualizar` to be seen. `/subte [líneas]` shows the current status on demand
+  (all lines, or e.g. `/subte D C`).
 - `emoji_suggest.py` — `suggest_emojis(title)`: best-effort emoji suggestions for a new task title,
   used by `new_task_flow.py`. A small hand-written Spanish task-verb overlay, backed by a much larger
   automatic reverse index built at import time from the `emoji` package's Spanish CLDR names.

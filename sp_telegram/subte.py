@@ -40,8 +40,12 @@ SIGNALR_EVENT = "estadoLineas"
 # Substrings (lowercased, accent-stripped) that make a line's status text an
 # actual service problem. Anything else that isn't "Normal" (closed stations
 # for works, extended hours...) is informational: shown, but not alarming.
+# "frecuencia" alone isn't a problem — recovery notices say "normalizando su
+# frecuencia habitual" — only when qualified as degraded ("frecuencia
+# reducida" is already covered by "reducid").
 _PROBLEM_RE = re.compile(
-    r"\b(demora|interrump|interrupc|limitad|sin servicio|suspend|frecuencia"
+    r"\b(demora|interrump|interrupc|limitad|sin servicio|suspend"
+    r"|baja frecuencia|frecuencia (irregular|afectada|demorada)"
     r"|medida de fuerza|paro\b|reducid|incidente|no funciona)"
 )
 
@@ -169,6 +173,22 @@ def _lines_report(lines: list, statuses: Optional[dict]) -> tuple:
         elif text and text.lower() != "normal":
             out.append(f"ℹ️ Línea {html.escape(line)}: {html.escape(text)}")
     return problem, out
+
+
+def format_status_report(statuses: dict, lines: Optional[list] = None) -> str:
+    """Message for the /subte command: every line (or only `lines`), one per
+    row, flagged ok / informational / problem."""
+    out = []
+    for line in lines or list(statuses):
+        text = statuses.get(line)
+        if classify(text) == "problem":
+            icon = "🚨"
+        elif text and text.lower() != "normal":
+            icon = "ℹ️"
+        else:
+            icon = "✅"
+        out.append(f"{icon} <b>{html.escape(line)}</b>: {html.escape(text or 'sin información')}")
+    return "🚇 Estado del subte\n" + "\n".join(out)
 
 
 def _send(text: str) -> None:
