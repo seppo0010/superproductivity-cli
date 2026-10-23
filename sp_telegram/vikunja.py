@@ -432,7 +432,9 @@ def _set_estimate(title: str, minutes: int) -> str:
 _ESTIMATE_OPTIONS = [(0, "0"), (5, "5m"), (10, "10m"), (15, "15m"), (60, "1h"), (120, "2h")]
 
 
-def _estimate_duration_keyboard(task_id: int) -> dict:
+def _estimate_duration_keyboard(task_id: int, cancel_data: str = "hcancel:0") -> dict:
+    """`cancel_data` lets the new-task flow swap in a cancel that also
+    deletes the just-created task, instead of only dismissing the prompt."""
     rows = [
         [
             {"text": label, "callback_data": f"estimdur:{task_id}:{minutes}"}
@@ -440,7 +442,7 @@ def _estimate_duration_keyboard(task_id: int) -> dict:
         ]
         for i in range(0, len(_ESTIMATE_OPTIONS), 3)
     ]
-    return {"inline_keyboard": rows + [[{"text": "❌ Cancelar", "callback_data": "hcancel:0"}]]}
+    return {"inline_keyboard": rows + [[{"text": "❌ Cancelar", "callback_data": cancel_data}]]}
 
 
 def _next_unestimated_task() -> Optional[dict]:

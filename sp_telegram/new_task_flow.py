@@ -36,7 +36,7 @@ def _show_project_picker(chat_id, title: str, message_id=None) -> None:
         "inline_keyboard": [
             [{"text": vk._project_display(p), "callback_data": f"ntproj:{i}"}]
             for i, p in enumerate(projects)
-        ]
+        ] + [[{"text": "❌ Cancelar", "callback_data": "hcancel:0"}]]
     }
     text = f"📝 {title}\n¿En qué proyecto?"
     if message_id is None:
@@ -202,7 +202,7 @@ def _handle_new_task_due(callback_id: str, chat_id, message_id, payload: str) ->
                 f"✅ Creada: {pending['title']}\nProyecto: {pending['project_title']}\n"
                 f"Vencimiento: {due_label}\n⏱ ¿Cuánto estimás que dura?"
             ),
-            reply_markup=vk._estimate_duration_keyboard(created["id"]),
+            reply_markup=vk._estimate_duration_keyboard(created["id"], cancel_data=f"ntcancel:{created['id']}"),
         )
         with _state_lock:
             estimate_state = _load_json(config.PENDING_ESTIMATE_STATE_FILE, {})
@@ -218,3 +218,42 @@ def _handle_new_task_due(callback_id: str, chat_id, message_id, payload: str) ->
     )
     _telegram_call("answerCallbackQuery", callback_query_id=callback_id, text="Creada")
     config.log.info("Created task '%s' for chat %s", pending["title"], chat_id)
+
+
+def _handle_new_task_cancel(callback_id: str, chat_id, message_id, payload: str) -> None:
+    """"Cancelar" on the estimate prompt that ends the new-task flow: the task
+    already exists in Vikunja by then, so cancelling deletes it. Only done
+    while that task is still the chat's pending estimate, so a stale button
+    can't delete a task the user has since finished setting up."""
+    try:
+        task_id = int(payload)
+    except ValueError:
+        task_id = -1
+
+    with _state_lock:
+        estimate_state = _load_json(config.PENDING_ESTIMATE_STATE_FILE, {})
+        pending = estimate_state.get(str(chat_id))
+        if not pending or pending.get("task_id") != task_id:
+            pending = None
+        else:
+            estimate_state.pop(str(chat_id), None)
+            _save_json(config.PENDING_ESTIMATE_STATE_FILE, estimate_state)
+
+    if pending is None:
+        _telegram_call(
+            "answerCallbackQuery", callback_query_id=callback_id,
+            text="No hay ninguna tarea pendiente", show_alert=True,
+        )
+        return
+
+    try:
+        vk._vk_delete(f"/tasks/{task_id}")
+    except requests.RequestException as e:
+        config.log.error("Could not delete cancelled new task %s: %s", task_id, e)
+        _telegram_call("editMessageText", chat_id=chat_id, message_id=message_id, text=f"Error: {e}")
+        _telegram_call("answerCallbackQuery", callback_query_id=callback_id, text="Error", show_alert=True)
+        return
+
+    _telegram_call("editMessageText", chat_id=chat_id, message_id=message_id, text="Cancelado")
+    _telegram_call("answerCallbackQuery", callback_query_id=callback_id)
+    config.log.info("Cancelled new task %s for chat %s (deleted)", task_id, chat_id)

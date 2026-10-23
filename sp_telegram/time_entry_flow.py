@@ -122,7 +122,7 @@ def _handle_time_entry(chat_id, text: str, pending: dict) -> None:
                     f"✅ Creada: {pending['title']}\nProyecto: {pending['project_title']}\n"
                     f"Vencimiento: {due_label}\n⏱ ¿Cuánto estimás que dura?"
                 ),
-                reply_markup=vk._estimate_duration_keyboard(created["id"]),
+                reply_markup=vk._estimate_duration_keyboard(created["id"], cancel_data=f"ntcancel:{created['id']}"),
             )
             with _state_lock:
                 estimate_state = _load_json(config.PENDING_ESTIMATE_STATE_FILE, {})

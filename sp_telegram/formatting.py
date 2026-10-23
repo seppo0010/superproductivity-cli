@@ -17,6 +17,7 @@ _DUE_DATE_KEYBOARD = {
             {"text": "Hoy", "callback_data": "ntdue:today"},
             {"text": "Mañana", "callback_data": "ntdue:tomorrow"},
         ],
+        [{"text": "❌ Cancelar", "callback_data": "hcancel:0"}],
     ]
 }
 
