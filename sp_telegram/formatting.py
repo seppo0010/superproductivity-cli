@@ -67,15 +67,31 @@ def _task_title_link(task: dict) -> str:
     return "".join(parts)
 
 
+def _occurrence_token(task: dict) -> Optional[str]:
+    """Identifies a recurring task's current occurrence in `/hecho<id>_<token>`:
+    its local due date (`YYYYMMDD`), plus the local time (`YYYYMMDDHHMM`)
+    when it repeats more than once a day — several occurrences can share a
+    date then. None for a one-off task or one with no due date."""
+    if not vk._is_recurring(task):
+        return None
+    due = vk._parse_vikunja_ts(task.get("due_date", ""))
+    if due is None:
+        return None
+    local = due.astimezone()
+    if (task.get("repeat_after") or 0) % 86400:
+        return local.strftime("%Y%m%d%H%M")
+    return local.strftime("%Y%m%d")
+
+
 def _hecho_command(task: dict) -> str:
     """Tappable `/hecho<id>` command that marks the task done. Recurring
-    tasks get the occurrence's local due date appended
-    (`/hecho<id>_<YYYYMMDD>`) so tapping the same command twice can't
-    silently complete two occurrences — the second tap no longer matches
-    the (already advanced) due date and is rejected."""
-    day = vk._task_local_date(task) if vk._is_recurring(task) else None
-    if day is not None:
-        return f" /hecho{task['id']}_{day.strftime('%Y%m%d')}"
+    tasks get the occurrence appended (`/hecho<id>_<token>`, see
+    _occurrence_token) so tapping the same command twice can't silently
+    complete two occurrences — the second tap no longer matches the
+    (already advanced) due date and is rejected."""
+    token = _occurrence_token(task)
+    if token is not None:
+        return f" /hecho{task['id']}_{token}"
     return f" /hecho{task['id']}"
 
 
@@ -134,11 +150,6 @@ def _format_day_message(
 
         for t in tasks:
             due_dt = vk._task_due_dt(t)
-            # A projected future occurrence of a recurring task (see
-            # vk._recurring_projection_dates) still carries its *original*
-            # due date, not `day` — combine its time-of-day with `day`
-            # itself so it sorts correctly against same-day tasks/events
-            # instead of by that stale date.
             if due_dt is None:
                 local_dt = None
             elif day is not None:
@@ -151,9 +162,8 @@ def _format_day_message(
             # A projected occurrence isn't a real task instance — Vikunja
             # can't mark it done ahead of its actual (earlier) occurrence,
             # so completing it would really just complete that earlier one.
-            # Only offer /hecho on the entry that's genuinely due `day`.
-            is_projected = day is not None and vk._task_local_date(t) != day
-            hecho = "" if is_projected else _hecho_command(t)
+            # Only offer /hecho on the real (current) occurrence.
+            hecho = "" if t.get("_projected") else _hecho_command(t)
             entries.append((
                 sort_key,
                 f"🕐 {time_str}  {vk._priority_prefix(t)}{_task_title_link(t)} · {html.escape(project_title)}{_labels_text(t)}{hecho}",

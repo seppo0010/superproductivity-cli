@@ -3,6 +3,7 @@ from datetime import date
 from unittest.mock import patch
 
 from sp_telegram import formatting
+from sp_telegram import vikunja as vk
 
 
 class LoadHeatEmoji(unittest.TestCase):
@@ -135,12 +136,12 @@ class TappableCommands(unittest.TestCase):
         self.assertIn("/dia20260920", msg)
 
     def test_day_message_omits_hecho_for_projected_recurring_occurrence(self):
-        # Task actually due 2026-09-19, shown on 2026-09-23 only because its
-        # fixed repeat interval projects it there (see
-        # vk._recurring_projection_dates) — marking it done here would really
-        # complete the 2026-09-19 occurrence, not this one, so no /hecho.
+        # Shown on 2026-09-23 only because its fixed repeat interval projects
+        # it there (see vk._recurring_projections) — marking it done here
+        # would really complete the earlier real occurrence, so no /hecho.
         real_task = {"id": 7, "title": "Real", "project_id": 1, "due_date": "2026-09-19T10:00:00Z"}
-        projected_task = {"id": 8, "title": "Projected", "project_id": 1, "due_date": "2026-09-19T10:00:00Z"}
+        projected_task = {"id": 8, "title": "Projected", "project_id": 1, "due_date": "2026-09-23T10:00:00Z",
+                          "_projected": True}
         with patch("sp_telegram.vikunja._real_projects", return_value=[]):
             msg, _ = formatting._format_day_message(
                 [projected_task], "23/09", day=date(2026, 9, 23),
@@ -161,6 +162,21 @@ class HechoOccurrenceGuard(unittest.TestCase):
 
     def test_recurring_command_includes_occurrence_date(self):
         self.assertEqual(formatting._hecho_command(self.RECURRING), " /hecho7_20261017")
+
+    def test_subdaily_recurring_command_includes_occurrence_time(self):
+        task = dict(self.RECURRING, repeat_after=8 * 3600)
+        local = vk._parse_vikunja_ts(task["due_date"]).astimezone().strftime("%Y%m%d%H%M")
+        self.assertEqual(formatting._hecho_command(task), f" /hecho7_{local}")
+
+    def test_subdaily_stale_same_day_occurrence_is_rejected(self):
+        task = dict(self.RECURRING, repeat_after=8 * 3600, due_date="2026-10-17T11:00:00Z")
+        token = formatting._occurrence_token(task)
+        advanced = dict(task, due_date="2026-10-17T19:00:00Z")  # next occurrence, same local day
+        upd, tg = self._run(f"/hecho7_{token}", advanced)
+        upd.assert_not_called()
+        self.assertIn("ya no está pendiente", tg.call_args.kwargs["text"])
+        upd, _ = self._run(f"/hecho7_{token}", task)
+        upd.assert_called_once_with(7, {"done": True})
 
     def test_one_off_command_has_no_date(self):
         task = {"id": 9, "title": "Foo", "due_date": "2026-10-17T13:00:00Z"}

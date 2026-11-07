@@ -24,31 +24,40 @@ from .telegram_api import _telegram_call
 from .time_entry_flow import _handle_time_entry
 
 
-def _handle_hecho_command(chat_id, task_id: int, occurrence: Optional[date] = None) -> None:
-    """`/hecho<id>[_<YYYYMMDD>]`: mark that task done, snapshotting it for
-    undo. For a recurring task the occurrence date is required and must
-    match its current due date: marking it done just advances the due date
-    in place, so without this check a repeated tap would silently complete
-    the next occurrence too. See formatting._hecho_command."""
+def _occurrence_label(token: str) -> str:
+    """Human form of a formatting._occurrence_token: DD/MM/YYYY[ HH:MM]."""
+    fmt = "%Y%m%d%H%M" if len(token) == 12 else "%Y%m%d"
+    out = "%d/%m/%Y %H:%M" if len(token) == 12 else "%d/%m/%Y"
+    return datetime.strptime(token, fmt).strftime(out)
+
+
+def _handle_hecho_command(chat_id, task_id: int, occurrence: Optional[str] = None) -> None:
+    """`/hecho<id>[_<token>]`: mark that task done, snapshotting it for
+    undo. For a recurring task the occurrence token (local due date, plus
+    time for sub-daily repeats — see formatting._occurrence_token) is
+    required and must match its current due date: marking it done just
+    advances the due date in place, so without this check a repeated tap
+    would silently complete the next occurrence too. A date-only token is
+    still accepted for a sub-daily task (compared by date only)."""
     try:
         task = vk._find_task(task_id)
         if task is None:
             _telegram_call("sendMessage", chat_id=chat_id, text="Esa tarea ya no existe.")
             return
         if vk._is_recurring(task):
-            current = vk._task_local_date(task)
+            current = formatting._occurrence_token(task)
             if occurrence is None and current is not None:
                 _telegram_call(
                     "sendMessage", chat_id=chat_id,
                     text=f"🔁 {task['title']} es recurrente — la ocurrencia pendiente vence el "
-                         f"{current.strftime('%d/%m/%Y')}. Para marcarla: /hecho{task_id}_{current.strftime('%Y%m%d')}",
+                         f"{_occurrence_label(current)}. Para marcarla: /hecho{task_id}_{current}",
                 )
                 return
-            if occurrence is not None and occurrence != current:
-                next_str = current.strftime("%d/%m/%Y") if current else "sin fecha"
+            if occurrence is not None and (current is None or not current.startswith(occurrence)):
+                next_str = _occurrence_label(current) if current else "sin fecha"
                 _telegram_call(
                     "sendMessage", chat_id=chat_id,
-                    text=f"⚠️ La ocurrencia del {occurrence.strftime('%d/%m/%Y')} de {task['title']} "
+                    text=f"⚠️ La ocurrencia del {_occurrence_label(occurrence)} de {task['title']} "
                          f"ya no está pendiente (la próxima vence el {next_str}). No cambié nada.",
                 )
                 return
@@ -410,12 +419,12 @@ def _handle_message(message: dict) -> None:
         config.log.info("Set availability %s=%s to %s for chat %s", kind, key, window_iso, chat_id)
         return
 
-    hecho_match = re.fullmatch(r"/hecho(\d+)(?:_(\d{8}))?", command)
+    hecho_match = re.fullmatch(r"/hecho(\d+)(?:_(\d{12}|\d{8}))?", command)
     if hecho_match:
-        occurrence = None
-        if hecho_match.group(2):
+        occurrence = hecho_match.group(2)
+        if occurrence:
             try:
-                occurrence = datetime.strptime(hecho_match.group(2), "%Y%m%d").date()
+                _occurrence_label(occurrence)
             except ValueError:
                 _telegram_call("sendMessage", chat_id=chat_id, text="Fecha inválida.")
                 return

@@ -339,3 +339,35 @@ class NextOccurrence(unittest.TestCase):
 
     def test_no_due_date(self):
         self.assertIsNone(self._next("", repeat_mode=0, repeat_after=86400))
+
+
+class RecurringProjections(unittest.TestCase):
+    @staticmethod
+    def _iso(day, hh, mm=0):
+        return datetime.combine(day, dtime(hh, mm)).astimezone().astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    def _local_times(self, copies):
+        return [vk._parse_vikunja_ts(c["due_date"]).astimezone().strftime("%m-%d %H:%M") for c in copies]
+
+    def test_every_8_hours_projects_remaining_same_day_and_next_day_slots(self):
+        d = date(2026, 11, 8)
+        task = {"id": 810, "repeat_after": 8 * 3600, "repeat_mode": 0, "due_date": self._iso(d, 6)}
+        self.assertEqual(self._local_times(vk._recurring_projections(task, d, d)), ["11-08 14:00", "11-08 22:00"])
+        nxt = d + timedelta(days=1)
+        self.assertEqual(self._local_times(vk._recurring_projections(task, nxt, nxt)),
+                         ["11-09 06:00", "11-09 14:00", "11-09 22:00"])
+        far = d + timedelta(days=20)
+        self.assertEqual(len(vk._recurring_projections(task, far, far)), 3)
+        self.assertTrue(all(c["_projected"] for c in vk._recurring_projections(task, d, nxt)))
+
+    def test_whole_day_interval_keeps_time_and_skips_current(self):
+        d = date(2026, 11, 8)
+        task = {"id": 1, "repeat_after": 2 * 86400, "repeat_mode": 0, "due_date": self._iso(d, 23, 59)}
+        copies = vk._recurring_projections(task, d, d + timedelta(days=5))
+        self.assertEqual(self._local_times(copies), ["11-10 23:59", "11-12 23:59"])
+        self.assertIsNone(vk._task_due_dt(copies[0]))  # sentinel preserved
+
+    def test_from_current_date_mode_is_not_projected(self):
+        d = date(2026, 11, 8)
+        task = {"id": 1, "repeat_after": 8 * 3600, "repeat_mode": 2, "due_date": self._iso(d, 6)}
+        self.assertEqual(vk._recurring_projections(task, d, d + timedelta(days=2)), [])
