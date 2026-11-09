@@ -129,8 +129,12 @@ def _handle_callback(callback: dict) -> None:
                 "snooze1440": timedelta(hours=24),
             }[action]
             new_dt = datetime.now(timezone.utc) + delta
-            fork = vk._postpone_task(task, new_dt.strftime("%Y-%m-%dT%H:%M:%SZ"))
-            result_text = f"⏰ {task['title']} — pospuesta a las {new_dt.astimezone().strftime('%Y-%m-%d %H:%M')}"
+            new_due_iso = new_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+            fork = vk._postpone_task(task, new_due_iso)
+            result_text = (
+                f"⏰ {task['title']} — pospuesta a las {new_dt.astimezone().strftime('%Y-%m-%d %H:%M')}\n"
+                f"{formatting._due_countdown_line(new_due_iso)}"
+            )
         elif action == "snoozeday":
             fork = vk._postpone_task(task, vk._day_to_due_iso(date.today()))
             result_text = f"⏰ {task['title']} — pospuesta a hoy, sin hora fija"

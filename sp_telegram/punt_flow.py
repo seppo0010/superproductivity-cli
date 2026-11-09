@@ -10,7 +10,7 @@ import requests
 
 from . import config
 from . import vikunja as vk
-from .formatting import _DUE_DATE_HINT, _punt_due_keyboard
+from .formatting import _DUE_DATE_HINT, _due_countdown_line, _due_label, _punt_due_keyboard
 from .state import _load_json, _save_json, _state_lock
 from .telegram_api import _telegram_call
 
@@ -78,7 +78,10 @@ def _apply_punt(task: dict, task_id: int, due_date_iso: str, due_label: str) -> 
         state[str(task_id)] = entry
         _save_json(config.UNDO_STATE_FILE, state)
     config.log.info("Punted task %s to %s%s", task_id, due_label, f" (fork {fork['id']})" if fork else "")
-    return f"📅 {task['title']} — pospuesta a {due_label}{_FORK_NOTE if fork else ''}"
+    return (
+        f"📅 {task['title']} — pospuesta a {due_label}\n"
+        f"{_due_countdown_line(due_date_iso)}{_FORK_NOTE if fork else ''}"
+    )
 
 
 def _handle_punt_due(callback_id: str, chat_id, message_id, payload: str) -> None:
@@ -118,10 +121,8 @@ def _handle_punt_due(callback_id: str, chat_id, message_id, payload: str) -> Non
 
     if option == "snooze10":
         due_date_iso = (datetime.now(timezone.utc) + timedelta(minutes=10)).strftime("%Y-%m-%dT%H:%M:%SZ")
-        due_label = "en 10 minutos"
     elif option == "snooze60":
         due_date_iso = (datetime.now(timezone.utc) + timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M:%SZ")
-        due_label = "en 1 hora"
     elif option == "snooze1440":
         # Adds a day to the task's own due date (preserving its time-of-day,
         # including the 23:59 "no specific time" sentinel), not to "now" —
@@ -129,16 +130,15 @@ def _handle_punt_due(callback_id: str, chat_id, message_id, payload: str) -> Non
         # to be right now, defeating the point of that convention.
         base = vk._parse_vikunja_ts(task.get("due_date", "")) or datetime.now(timezone.utc)
         due_date_iso = (base + timedelta(hours=24)).strftime("%Y-%m-%dT%H:%M:%SZ")
-        due_label = "24 horas más tarde"
     elif option == "today":
-        due_date_iso, due_label = vk._day_to_due_iso(date.today()), "hoy, sin hora"
+        due_date_iso = vk._day_to_due_iso(date.today())
     else:
         config.log.warning("Unknown puntdue option: %s", option)
         _telegram_call("answerCallbackQuery", callback_query_id=callback_id)
         return
 
     try:
-        result_text = _apply_punt(task, task_id, due_date_iso, due_label)
+        result_text = _apply_punt(task, task_id, due_date_iso, _due_label(due_date_iso))
     except requests.RequestException as e:
         config.log.error("Could not punt task %s: %s", task_id, e)
         _telegram_call(

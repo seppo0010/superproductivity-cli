@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import html
 import re
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from typing import Optional
 
 from . import config
@@ -22,6 +22,60 @@ _DUE_DATE_KEYBOARD = {
 }
 
 _DUE_DATE_HINT = "o escribí HH:MM, D/M[/Y] o D/M[/Y] HH:MM"
+
+
+def _due_label(due_date_iso: str) -> str:
+    """Absolute local rendering of a due date, e.g. "2026-12-11 14:30", or
+    "2026-12-11, sin hora" for the 23:59 "no specific time" sentinel."""
+    formatted = vk._format_due({"due_date": due_date_iso})
+    if formatted:
+        return formatted
+    return f"{vk._parse_vikunja_ts(due_date_iso).astimezone():%Y-%m-%d}, sin hora"
+
+
+def _count_noun(n: int, singular: str, plural: Optional[str] = None) -> str:
+    return f"{n} {singular if n == 1 else (plural or singular + 's')}"
+
+
+def _approx_days(days: int) -> str:
+    """Spanish amount for a span of 2+ days; anything coarser than days gets
+    an "aprox." since weeks/months/years are rounded."""
+    if days < 14:
+        return _count_noun(days, "día")
+    if days < 28:
+        return f"aprox. {_count_noun(round(days / 7), 'semana')}"
+    months = round(days / 30.44)
+    if months < 12:
+        return f"aprox. {_count_noun(months, 'mes', 'meses')}"
+    return f"aprox. {_count_noun(max(1, round(days / 365.25)), 'año')}"
+
+
+def _due_countdown_line(due_date_iso: str, now: Optional[datetime] = None) -> str:
+    """One line saying roughly how far away a just-set due date is, so a
+    mistyped date (11/12 instead of 11/11) stands out in the confirmation.
+    A due date already in the past is flagged instead. Date-only tasks (the
+    23:59 sentinel) are measured in calendar days, never hours."""
+    due = vk._parse_vikunja_ts(due_date_iso)
+    now = now or datetime.now(timezone.utc)
+    days = (due.astimezone().date() - now.astimezone().date()).days
+    timeless = vk._task_due_dt({"due_date": due_date_iso}) is None
+    past = days < 0 if timeless else due <= now
+    minutes = round(abs((due - now).total_seconds()) / 60)
+
+    if not timeless and minutes < 60:
+        amount = _count_noun(max(minutes, 1), "minuto")
+    elif not timeless and minutes < 24 * 60:
+        amount = _count_noun(round(minutes / 60), "hora")
+    elif days == 0:
+        return "⏳ Vence hoy"
+    elif days == 1:
+        return "⏳ Vence mañana"
+    elif days == -1:
+        return "⚠️ Ya venció: fue ayer"
+    else:
+        amount = _approx_days(abs(days))
+
+    return f"⚠️ Ya venció: fue hace {amount}" if past else f"⏳ Vence en {amount}"
 
 
 def _labels_text(task: dict) -> str:

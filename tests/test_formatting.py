@@ -1,9 +1,85 @@
+import tempfile
 import unittest
-from datetime import date
+from datetime import date, datetime, timedelta, timezone
+from pathlib import Path
 from unittest.mock import patch
 
-from sp_telegram import formatting
+from sp_telegram import formatting, punt_flow
 from sp_telegram import vikunja as vk
+
+
+class DueCountdownLine(unittest.TestCase):
+    # Local noon, so offsets never land on the 23:59 "sin hora" sentinel.
+    NOW = datetime(2026, 11, 9, 12, 0).astimezone()
+
+    def _timed(self, **delta):
+        iso = (self.NOW + timedelta(**delta)).astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        return formatting._due_countdown_line(iso, now=self.NOW)
+
+    def _day(self, day):
+        return formatting._due_countdown_line(vk._day_to_due_iso(day), now=self.NOW)
+
+    def test_minutes(self):
+        self.assertEqual(self._timed(minutes=10), "⏳ Vence en 10 minutos")
+
+    def test_one_hour_is_singular(self):
+        self.assertEqual(self._timed(hours=1), "⏳ Vence en 1 hora")
+
+    def test_timed_within_a_day_uses_hours(self):
+        self.assertEqual(self._timed(hours=5), "⏳ Vence en 5 horas")
+
+    def test_timed_next_day_after_24h(self):
+        self.assertEqual(self._timed(hours=25), "⏳ Vence mañana")
+
+    def test_mistyped_month_stands_out_from_intended_date(self):
+        self.assertEqual(self._day(date(2026, 11, 11)), "⏳ Vence en 2 días")
+        self.assertEqual(self._day(date(2026, 12, 11)), "⏳ Vence en aprox. 1 mes")
+
+    def test_timeless_today_and_tomorrow_ignore_hours(self):
+        self.assertEqual(self._day(date(2026, 11, 9)), "⏳ Vence hoy")
+        self.assertEqual(self._day(date(2026, 11, 10)), "⏳ Vence mañana")
+
+    def test_weeks(self):
+        self.assertEqual(self._day(date(2026, 11, 30)), "⏳ Vence en aprox. 3 semanas")
+
+    def test_months(self):
+        self.assertEqual(self._day(date(2027, 3, 9)), "⏳ Vence en aprox. 4 meses")
+
+    def test_rolled_over_to_next_year_reads_as_one_year(self):
+        self.assertEqual(self._day(date(2027, 11, 8)), "⏳ Vence en aprox. 1 año")
+
+    def test_past_timed_is_flagged(self):
+        self.assertEqual(self._timed(hours=-3), "⚠️ Ya venció: fue hace 3 horas")
+
+    def test_past_days_are_flagged(self):
+        self.assertEqual(self._day(date(2026, 11, 8)), "⚠️ Ya venció: fue ayer")
+        self.assertEqual(self._day(date(2026, 11, 4)), "⚠️ Ya venció: fue hace 5 días")
+
+
+class DueLabel(unittest.TestCase):
+    def test_timed(self):
+        iso = vk._local_time_to_iso(date(2026, 12, 11), 14, 30)
+        self.assertEqual(formatting._due_label(iso), "2026-12-11 14:30")
+
+    def test_sentinel_says_sin_hora(self):
+        self.assertEqual(formatting._due_label(vk._day_to_due_iso(date(2026, 12, 11))), "2026-12-11, sin hora")
+
+
+class ApplyPuntConfirmation(unittest.TestCase):
+    def _apply(self, repeat_after=0, fork=None):
+        task = {"id": 5, "title": "Foo", "repeat_after": repeat_after}
+        iso = vk._day_to_due_iso(date.today() + timedelta(days=2))
+        with tempfile.TemporaryDirectory() as d, \
+                patch.object(punt_flow.config, "UNDO_STATE_FILE", Path(d) / "undo.json"), \
+                patch.object(punt_flow.vk, "_postpone_task", return_value=fork):
+            return punt_flow._apply_punt(task, 5, iso, "LABEL")
+
+    def test_includes_countdown(self):
+        self.assertEqual(self._apply(), "📅 Foo — pospuesta a LABEL\n⏳ Vence en 2 días")
+
+    def test_fork_note_goes_after_countdown(self):
+        text = self._apply(repeat_after=86400, fork={"id": 9})
+        self.assertEqual(text, f"📅 Foo — pospuesta a LABEL\n⏳ Vence en 2 días{punt_flow._FORK_NOTE}")
 
 
 class LoadHeatEmoji(unittest.TestCase):
