@@ -278,6 +278,16 @@ def _load_heat_emoji(total: int, free_minutes: Optional[int]) -> str:
     return "🟥"
 
 
+def _day_command(day: date) -> str:
+    """Tappable command that shows `day`'s task list."""
+    today = date.today()
+    if day == today:
+        return "/today"
+    if day == today + timedelta(days=1):
+        return "/tomorrow"
+    return f"/dia{day.strftime('%Y%m%d')}"
+
+
 def _format_load_message(by_date: dict, start: date, days: int, events_by_date: Optional[dict] = None) -> str:
     """Per-day estimated load vs free time left after calendar events, for
     spotting overloaded days ahead of time (and free ones worth pulling
@@ -289,7 +299,7 @@ def _format_load_message(by_date: dict, start: date, days: int, events_by_date: 
         day_tasks = by_date.get(day, [])
         day_events = events_by_date.get(day, [])
         day_label = f"{vk._WEEKDAY_SHORT[day.weekday()]} {day.strftime('%d/%m')}"
-        day_cmd = f"/dia{day.strftime('%Y%m%d')}"
+        day_cmd = _day_command(day)
 
         _, free_minutes, elapsed = vk._free_windows_for(day, day_events)
 

@@ -56,6 +56,29 @@ class DueCountdownLine(unittest.TestCase):
         self.assertEqual(self._day(date(2026, 11, 4)), "⚠️ Ya venció: fue hace 5 días")
 
 
+class DayCommand(unittest.TestCase):
+    def test_today(self):
+        self.assertEqual(formatting._day_command(date.today()), "/today")
+
+    def test_tomorrow(self):
+        self.assertEqual(formatting._day_command(date.today() + timedelta(days=1)), "/tomorrow")
+
+    def test_other_days_keep_dated_command(self):
+        day = date.today() + timedelta(days=2)
+        self.assertEqual(formatting._day_command(day), f"/dia{day:%Y%m%d}")
+        day = date.today() - timedelta(days=1)
+        self.assertEqual(formatting._day_command(day), f"/dia{day:%Y%m%d}")
+
+    def test_load_message_uses_short_commands_for_first_two_days(self):
+        start = date.today()
+        with patch.object(formatting.vk, "_free_windows_for", return_value=([], None, False)):
+            msg = formatting._format_load_message({}, start, 3)
+        self.assertIn("/today", msg)
+        self.assertIn("/tomorrow", msg)
+        self.assertIn(f"/dia{start + timedelta(days=2):%Y%m%d}", msg)
+        self.assertNotIn(f"/dia{start:%Y%m%d}", msg)
+
+
 class DueLabel(unittest.TestCase):
     def test_timed(self):
         iso = vk._local_time_to_iso(date(2026, 12, 11), 14, 30)
