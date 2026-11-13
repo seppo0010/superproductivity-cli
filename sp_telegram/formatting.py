@@ -151,16 +151,23 @@ def _hecho_command(task: dict) -> str:
 
 def _format_day_message(
     tasks: list, label: str, overdue: Optional[list] = None, day: Optional[date] = None,
-    events: Optional[list] = None,
+    events: Optional[list] = None, hide_future_events: bool = False,
 ) -> tuple:
     """Returns (text, keyboard) — keyboard is a one-button "estimate this"
-    shortcut when at least one of `tasks` has no estimate yet, else None."""
+    shortcut when at least one of `tasks` has no estimate yet, else None.
+
+    `hide_future_events` (used by /pending) leaves out timed events that
+    haven't started yet; they still count toward the free-time figure."""
     overdue = overdue or []
     events = events or []
+    shown_events = events
     if day == date.today():
         now = datetime.now()
         events = [e for e in events if e["all_day"] or e["end"] > now]
-    if not tasks and not overdue and not events:
+        shown_events = events
+        if hide_future_events:
+            shown_events = [e for e in events if e["all_day"] or e["start"] <= now]
+    if not tasks and not overdue and not shown_events:
         return f"🎉 No hay tareas para {label}.", None
 
     project_map = vk._project_title_map()
@@ -177,6 +184,7 @@ def _format_day_message(
         lines.append("")
 
     _, free_minutes, elapsed = vk._free_windows_for(day, events) if day is not None else (None, None, False)
+    events = shown_events
 
     if tasks or events:
         if tasks and events:

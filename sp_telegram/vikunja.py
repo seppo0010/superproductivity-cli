@@ -123,6 +123,13 @@ def _task_due_dt(task: dict) -> Optional[datetime]:
     return dt
 
 
+def _has_future_due_time(task: dict, now: datetime) -> bool:
+    """True if the task has an explicit time-of-day (not the 23:59 "no
+    specific time" sentinel) that is still in the future relative to `now`."""
+    dt = _task_due_dt(task)
+    return dt is not None and dt > now
+
+
 def _task_local_date(task: dict) -> Optional[date]:
     dt = _parse_vikunja_ts(task.get("due_date", ""))
     if dt is None:

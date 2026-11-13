@@ -185,6 +185,32 @@ class FormatDayMessageEmpty(unittest.TestCase):
         self.assertIsNone(keyboard)
 
 
+class FormatDayMessageHideFutureEvents(unittest.TestCase):
+    def _events(self):
+        now = datetime.now()
+        def ev(title, start, end, all_day=False):
+            return {"title": title, "start": start, "end": end, "all_day": all_day, "busy": True}
+        return [
+            ev("Ongoing", now - timedelta(minutes=10), now + timedelta(minutes=10)),
+            ev("Later", now + timedelta(minutes=30), now + timedelta(minutes=60)),
+            ev("AllDay", now.replace(hour=0, minute=0), now.replace(hour=0, minute=0) + timedelta(days=1), True),
+        ]
+
+    def test_future_events_hidden(self):
+        with patch("sp_telegram.vikunja._real_projects", return_value=[]):
+            msg, _ = formatting._format_day_message(
+                [], "hoy", day=date.today(), events=self._events(), hide_future_events=True,
+            )
+        self.assertIn("Ongoing", msg)
+        self.assertIn("AllDay", msg)
+        self.assertNotIn("Later", msg)
+
+    def test_future_events_shown_by_default(self):
+        with patch("sp_telegram.vikunja._real_projects", return_value=[]):
+            msg, _ = formatting._format_day_message([], "hoy", day=date.today(), events=self._events())
+        self.assertIn("Later", msg)
+
+
 class FormatDayMessageEstimateShortcut(unittest.TestCase):
     def test_keyboard_offers_first_unestimated_task(self):
         tasks = [

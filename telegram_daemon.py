@@ -73,6 +73,7 @@ def main() -> None:
             "setMyCommands",
             commands=[
                 {"command": "hoy", "description": "Tareas de hoy"},
+                {"command": "pending", "description": "Lo de hoy sin lo que tiene horario futuro"},
                 {"command": "tomorrow", "description": "Tareas de mañana"},
                 {"command": "day", "description": "Tareas de una fecha (YYYY-MM-DD)"},
                 {"command": "carga", "description": "Carga estimada de los próximos días"},

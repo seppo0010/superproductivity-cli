@@ -1,4 +1,4 @@
-"""Slash-command handling: /hoy, /mañana, /day, /carga, /calendario,
+"""Slash-command handling: /hoy, /pending, /mañana, /day, /carga, /calendario,
 /disponibilidad, /hecho, /borrar, /tarjeta, /estimar, /sinestimar, /prioridad,
 /punt, /subte, and the plain-message fallback that starts the new-task or
 time-entry flow."""
@@ -94,7 +94,7 @@ def _handle_message(message: dict) -> None:
     command = parts[0].split("@", 1)[0]
     arg = parts[1].strip() if len(parts) > 1 else ""
 
-    if command in ("/hoy", "/today"):
+    if command in ("/hoy", "/today", "/pending"):
         try:
             tasks = vk._today_tasks()
             overdue = vk._overdue_tasks()
@@ -102,9 +102,17 @@ def _handle_message(message: dict) -> None:
             config.log.error("Could not fetch today's tasks: %s", e)
             _telegram_call("sendMessage", chat_id=chat_id, text=f"Error: {e}")
             return
+        if command == "/pending":
+            # Hide tasks scheduled for a specific time later today; the 23:59
+            # "no specific time" sentinel has no due time, so it stays.
+            now = datetime.now().astimezone()
+            tasks = [t for t in tasks if not vk._has_future_due_time(t, now)]
 
         events = ical._calendar_events_for_day(date.today())
-        text, keyboard = formatting._format_day_message(tasks, "hoy", overdue=overdue, day=date.today(), events=events)
+        text, keyboard = formatting._format_day_message(
+            tasks, "hoy", overdue=overdue, day=date.today(), events=events,
+            hide_future_events=(command == "/pending"),
+        )
         _telegram_call(
             "sendMessage", chat_id=chat_id, text=text, parse_mode="HTML", reply_markup=keyboard,
         )

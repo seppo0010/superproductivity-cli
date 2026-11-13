@@ -43,7 +43,7 @@ Telegram poll loop, reconciliation loop) and validates required env vars.
   (plain-text "HH:MM"/"D/M[/Y]" replies typed instead of pressing a button), `undo.py`.
 - `callback.py` — dispatches inline-keyboard presses to the flow modules; also handles the simple
   one-shot actions (done/delete/snooze/tarjeta) inline.
-- `commands.py` — dispatches slash commands (`/hoy`, `/carga`, `/disponibilidad`, `/calendario`, ...).
+- `commands.py` — dispatches slash commands (`/hoy`, `/pending`, `/carga`, `/disponibilidad`, `/calendario`, ...).
 - `poll.py` — the `getUpdates` long-poll loop that feeds `callback.py`/`commands.py`.
 
 ## Conventions worth knowing before editing

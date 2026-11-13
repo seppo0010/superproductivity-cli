@@ -371,3 +371,23 @@ class RecurringProjections(unittest.TestCase):
         d = date(2026, 11, 8)
         task = {"id": 1, "repeat_after": 8 * 3600, "repeat_mode": 2, "due_date": self._iso(d, 6)}
         self.assertEqual(vk._recurring_projections(task, d, d + timedelta(days=2)), [])
+
+
+class HasFutureDueTime(unittest.TestCase):
+    def _task(self, local_dt):
+        return {"due_date": local_dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")}
+
+    def test_future_explicit_time(self):
+        now = datetime(2026, 11, 13, 10, 0).astimezone()
+        self.assertTrue(vk._has_future_due_time(self._task(datetime(2026, 11, 13, 15, 0).astimezone()), now))
+
+    def test_past_explicit_time(self):
+        now = datetime(2026, 11, 13, 10, 0).astimezone()
+        self.assertFalse(vk._has_future_due_time(self._task(datetime(2026, 11, 13, 9, 0).astimezone()), now))
+
+    def test_2359_sentinel_is_not_future_time(self):
+        now = datetime(2026, 11, 13, 10, 0).astimezone()
+        self.assertFalse(vk._has_future_due_time(self._task(datetime(2026, 11, 13, 23, 59).astimezone()), now))
+
+    def test_no_due_date(self):
+        self.assertFalse(vk._has_future_due_time({}, datetime.now().astimezone()))
