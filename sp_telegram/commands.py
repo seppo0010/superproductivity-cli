@@ -102,16 +102,20 @@ def _handle_message(message: dict) -> None:
             config.log.error("Could not fetch today's tasks: %s", e)
             _telegram_call("sendMessage", chat_id=chat_id, text=f"Error: {e}")
             return
+        hidden_later_tasks = 0
         if command == "/pending":
             # Hide tasks scheduled for a specific time later today; the 23:59
             # "no specific time" sentinel has no due time, so it stays.
             now = datetime.now().astimezone()
-            tasks = [t for t in tasks if not vk._has_future_due_time(t, now)]
+            shown = [t for t in tasks if not vk._has_future_due_time(t, now)]
+            hidden_later_tasks = len(tasks) - len(shown)
+            tasks = shown
 
         events = ical._calendar_events_for_day(date.today())
         text, keyboard = formatting._format_day_message(
             tasks, "hoy", overdue=overdue, day=date.today(), events=events,
             hide_future_events=(command == "/pending"),
+            hidden_later_tasks=hidden_later_tasks,
         )
         _telegram_call(
             "sendMessage", chat_id=chat_id, text=text, parse_mode="HTML", reply_markup=keyboard,

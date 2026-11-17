@@ -205,6 +205,25 @@ class FormatDayMessageHideFutureEvents(unittest.TestCase):
         self.assertIn("AllDay", msg)
         self.assertNotIn("Later", msg)
 
+    def test_pending_heading_and_hidden_note(self):
+        with patch("sp_telegram.vikunja._real_projects", return_value=[]):
+            msg, _ = formatting._format_day_message(
+                [], "hoy", day=date.today(), events=self._events(),
+                hide_future_events=True, hidden_later_tasks=2,
+            )
+        self.assertIn("Pendiente ahora", msg)
+        self.assertNotIn("Agenda de hoy", msg)
+        self.assertIn("+3 programado(s) para más tarde", msg)
+
+    def test_pending_empty_mentions_hidden(self):
+        with patch("sp_telegram.vikunja._real_projects", return_value=[]):
+            msg, _ = formatting._format_day_message(
+                [], "hoy", day=date.today(), events=[],
+                hide_future_events=True, hidden_later_tasks=1,
+            )
+        self.assertIn("No hay nada pendiente por ahora", msg)
+        self.assertIn("+1 programado(s) para más tarde", msg)
+
     def test_future_events_shown_by_default(self):
         with patch("sp_telegram.vikunja._real_projects", return_value=[]):
             msg, _ = formatting._format_day_message([], "hoy", day=date.today(), events=self._events())

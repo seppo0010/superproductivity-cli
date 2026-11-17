@@ -151,13 +151,16 @@ def _hecho_command(task: dict) -> str:
 
 def _format_day_message(
     tasks: list, label: str, overdue: Optional[list] = None, day: Optional[date] = None,
-    events: Optional[list] = None, hide_future_events: bool = False,
+    events: Optional[list] = None, hide_future_events: bool = False, hidden_later_tasks: int = 0,
 ) -> tuple:
     """Returns (text, keyboard) — keyboard is a one-button "estimate this"
     shortcut when at least one of `tasks` has no estimate yet, else None.
 
     `hide_future_events` (used by /pending) leaves out timed events that
-    haven't started yet; they still count toward the free-time figure."""
+    haven't started yet; they still count toward the free-time figure. It
+    also switches the heading to "Pendiente ahora" and notes how many items
+    were left out (`hidden_later_tasks` = tasks the caller already filtered
+    out for having a due time later today, plus the hidden events)."""
     overdue = overdue or []
     events = events or []
     shown_events = events
@@ -167,7 +170,15 @@ def _format_day_message(
         shown_events = events
         if hide_future_events:
             shown_events = [e for e in events if e["all_day"] or e["start"] <= now]
+    hidden_later = hidden_later_tasks + (len(events) - len(shown_events))
+    later_note = (
+        f"<i>(+{hidden_later} programado(s) para más tarde, no se muestran)</i>"
+        if hide_future_events and hidden_later else ""
+    )
     if not tasks and not overdue and not shown_events:
+        if hide_future_events:
+            text = "🎉 No hay nada pendiente por ahora."
+            return (f"{text}\n{later_note}" if later_note else text), None
         return f"🎉 No hay tareas para {label}.", None
 
     project_map = vk._project_title_map()
@@ -187,7 +198,16 @@ def _format_day_message(
     events = shown_events
 
     if tasks or events:
-        if tasks and events:
+        if hide_future_events:
+            counts = []
+            if tasks:
+                counts.append(f"{len(tasks)} tarea(s)")
+            if events:
+                counts.append(f"{len(events)} evento(s)")
+            lines.append(f"⏳ <b>Pendiente ahora</b> ({', '.join(counts)})")
+            if later_note:
+                lines.append(later_note)
+        elif tasks and events:
             lines.append(f"📋 <b>Agenda de {label}</b> ({len(tasks)} tarea(s), {len(events)} evento(s))")
         elif tasks:
             lines.append(f"📋 <b>Tareas de {label}</b> ({len(tasks)})")
@@ -253,7 +273,12 @@ def _format_day_message(
             if missing:
                 lines.append(f"⚠️ {missing} tarea(s) sin estimación")
     elif overdue:
-        lines.append(f"🎉 No hay tareas para {label} (aparte de las vencidas).")
+        if hide_future_events:
+            lines.append("🎉 No hay nada más pendiente por ahora (aparte de las vencidas).")
+            if later_note:
+                lines.append(later_note)
+        else:
+            lines.append(f"🎉 No hay tareas para {label} (aparte de las vencidas).")
 
     keyboard = None
     first_unestimated = next((t for t in tasks if vk._parse_estimate_minutes(t["title"]) is None), None)
