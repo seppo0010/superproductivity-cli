@@ -29,6 +29,21 @@ def _telegram_call(method: str, **params) -> object:
     return body["result"]
 
 
+def _telegram_send_photo(chat_id, png: bytes, caption: str = "") -> object:
+    """sendPhoto needs a multipart upload, which _telegram_call (JSON body)
+    can't do. Caption is HTML parse mode (Telegram caps it at 1024 chars)."""
+    url = config.TELEGRAM_API.format(token=config.TOKEN, method="sendPhoto")
+    data = {"chat_id": chat_id}
+    if caption:
+        data.update(caption=caption, parse_mode="HTML")
+    r = requests.post(url, data=data, files={"photo": ("stats.png", png, "image/png")}, timeout=35)
+    r.raise_for_status()
+    body = r.json()
+    if not body.get("ok"):
+        raise RuntimeError(f"Telegram API error on sendPhoto: {body}")
+    return body["result"]
+
+
 def _send_due_notification(task: dict) -> Optional[int]:
     keyboard = {
         "inline_keyboard": [

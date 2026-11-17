@@ -51,8 +51,8 @@ import time
 
 import requests
 
-from sp_telegram import config
-from sp_telegram.notify import _run_webhook_server, check_daily_digest, check_due_tasks
+from sp_telegram import config, stats
+from sp_telegram.notify import _run_webhook_server, check_daily_digest, check_due_tasks, ensure_project_webhooks
 from sp_telegram.poll import poll_telegram_updates
 from sp_telegram.subte import check_subte_trips
 from sp_telegram.telegram_api import _telegram_call
@@ -85,16 +85,20 @@ def main() -> None:
                 {"command": "punt", "description": "Posponer una tarea vencida o de hoy"},
                 {"command": "estimar", "description": "Poner o cambiar la estimación de una tarea de hoy"},
                 {"command": "prioridad", "description": "Poner o cambiar la prioridad de una tarea de hoy"},
+                {"command": "stats", "description": "Estadísticas y gráfico de tareas completadas"},
             ],
         )
     except (requests.RequestException, RuntimeError) as e:
         config.log.warning("Could not register bot commands: %s", e)
+
+    stats.backfill()
 
     threading.Thread(target=poll_telegram_updates, daemon=True).start()
     threading.Thread(target=_run_webhook_server, daemon=True).start()
 
     while True:
         next_due_in = check_due_tasks()
+        ensure_project_webhooks()
         check_daily_digest()
         try:
             next_subte_in = check_subte_trips()

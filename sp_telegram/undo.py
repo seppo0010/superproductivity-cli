@@ -6,6 +6,7 @@ from __future__ import annotations
 import requests
 
 from . import config
+from . import stats
 from . import vikunja as vk
 from .state import _load_json, _save_json, _state_lock
 from .telegram_api import _telegram_call
@@ -60,6 +61,8 @@ def _handle_undo(callback_id: str, chat_id, message_id, payload: str) -> None:
                 "done": prev_task.get("done", False),
                 "due_date": prev_task.get("due_date") or "",
             })
+            if entry["action"] == "done":
+                stats.remove_latest_completion(prev_task["id"])
             result_text = f"↩️ {prev_task['title']} — deshecho"
     except (requests.RequestException, RuntimeError) as e:
         config.log.error("Could not undo action for task %s: %s", payload, e)

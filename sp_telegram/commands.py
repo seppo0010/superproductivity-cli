@@ -1,6 +1,6 @@
 """Slash-command handling: /hoy, /pending, /mañana, /day, /carga, /calendario,
 /disponibilidad, /hecho, /borrar, /tarjeta, /estimar, /sinestimar, /prioridad,
-/punt, /subte, and the plain-message fallback that starts the new-task or
+/punt, /subte, /stats, and the plain-message fallback that starts the new-task or
 time-entry flow."""
 
 from __future__ import annotations
@@ -15,12 +15,13 @@ import requests
 from . import config
 from . import formatting
 from . import ical
+from . import stats
 from . import subte
 from . import vikunja as vk
 from .estimate_priority_flow import _handle_estimate_text
 from .new_task_flow import _handle_new_task_emoji_text, _start_new_task
 from .state import _load_json, _save_json, _state_lock
-from .telegram_api import _telegram_call
+from .telegram_api import _telegram_call, _telegram_send_photo
 from .time_entry_flow import _handle_time_entry
 
 
@@ -80,6 +81,41 @@ def _handle_hecho_command(chat_id, task_id: int, occurrence: Optional[str] = Non
         reply_markup={"inline_keyboard": [[{"text": "↩️ Deshacer", "callback_data": f"undo:{task_id}"}]]},
     )
     config.log.info("Marked task %s done via /hecho%s", task_id, task_id)
+
+
+def _handle_stats_command(chat_id, arg: str) -> None:
+    """`/stats [días]` (default 30, max 365): completions-per-day chart with
+    a summary caption; falls back to text alone if the chart fails."""
+    days = 30
+    if arg:
+        try:
+            days = int(arg)
+        except ValueError:
+            _telegram_call("sendMessage", chat_id=chat_id, text="Usá /stats [días]. Ej: /stats o /stats 90")
+            return
+    days = max(1, min(days, 365))
+
+    today = date.today()
+    start = today - timedelta(days=days - 1)
+    try:
+        active = vk._vk_get("/tasks", {"filter": "done = false"})
+    except requests.RequestException as e:
+        config.log.error("Could not fetch tasks for /stats: %s", e)
+        _telegram_call("sendMessage", chat_id=chat_id, text=f"Error: {e}")
+        return
+
+    state = stats._load_state()
+    caption = stats.format_summary(
+        state["completions"], start, today, vk._project_title_map(), active, today,
+    )
+    try:
+        per_day = stats.completions_per_day(state["completions"], start, today)
+        png = stats.render_chart(per_day, state["snapshots"])
+        _telegram_send_photo(chat_id, png, caption)
+    except Exception as e:
+        config.log.exception("Could not send /stats chart: %s", e)
+        _telegram_call("sendMessage", chat_id=chat_id, text=caption, parse_mode="HTML")
+    config.log.info("Sent %d-day stats to chat %s", days, chat_id)
 
 
 def _handle_message(message: dict) -> None:
@@ -213,6 +249,10 @@ def _handle_message(message: dict) -> None:
             text=formatting._format_load_message(by_date, start, days, events_by_date=events_by_date), parse_mode="HTML"
         )
         config.log.info("Sent %d-day load overview to chat %s", days, chat_id)
+        return
+
+    if command in ("/stats", "/estadisticas"):
+        _handle_stats_command(chat_id, arg)
         return
 
     if command in ("/calendario", "/cal"):

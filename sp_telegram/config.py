@@ -14,6 +14,11 @@ VIKUNJA_TOKEN = os.environ.get("VIKUNJA_TOKEN")
 WEBHOOK_SECRET = os.environ.get("VIKUNJA_WEBHOOK_SECRET")
 WEBHOOK_HOST = os.environ.get("VIKUNJA_WEBHOOK_HOST", "0.0.0.0")
 WEBHOOK_PORT = int(os.environ.get("VIKUNJA_WEBHOOK_PORT", "8765"))
+# The URL Vikunja (in Docker) uses to reach the receiver above; per-project
+# task.updated webhooks are registered against it (notify.ensure_project_webhooks).
+WEBHOOK_TARGET_URL = os.environ.get("VIKUNJA_WEBHOOK_TARGET_URL", "http://host.docker.internal:8765/webhook")
+PROJECT_WEBHOOK_EVENTS = ["task.updated"]
+ENSURE_WEBHOOKS_INTERVAL_SECONDS = 3600
 
 TELEGRAM_API = "https://api.telegram.org/bot{token}/{method}"
 CHECK_INTERVAL_SECONDS = 300  # safety-net reconciliation cadence
@@ -29,6 +34,7 @@ PENDING_ESTIMATE_STATE_FILE = STATE_DIR / "pending_estimate_state.json"
 UNDO_STATE_FILE = STATE_DIR / "undo_state.json"
 AVAILABILITY_STATE_FILE = STATE_DIR / "availability.json"
 GOOGLE_CALENDAR_STATE_FILE = STATE_DIR / "calendars.json"
+STATS_STATE_FILE = STATE_DIR / "stats.json"
 GOOGLE_CALENDAR_CACHE_SECONDS = int(os.environ.get("GOOGLE_CALENDAR_CACHE_SECONDS", str(4 * 60 * 60)))
 DAILY_DIGEST_HOUR = 6
 

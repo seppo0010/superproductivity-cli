@@ -34,6 +34,8 @@ Telegram poll loop, reconciliation loop) and validates required env vars.
 - `emoji_suggest.py` — `suggest_emojis(title)`: best-effort emoji suggestions for a new task title,
   used by `new_task_flow.py`. A small hand-written Spanish task-verb overlay, backed by a much larger
   automatic reverse index built at import time from the `emoji` package's Spanish CLDR names.
+- `stats.py` — completion history + `/stats [días]` (matplotlib PNG via `sendPhoto`, summary caption).
+  See "Completion history" below.
 - `formatting.py` — renders tasks/events into Telegram message text (HTML parse mode) and inline keyboards.
 - `telegram_api.py` — thin Telegram Bot API wrapper (`_telegram_call`) + due-notification message builder.
 - `notify.py` — webhook receiver (push path for `task.overdue`/`tasks.overdue`), the reconciliation
@@ -75,6 +77,15 @@ Telegram poll loop, reconciliation loop) and validates required env vars.
   `new_task_flow._handle_new_task_emoji_text`, which scans the message for emoji characters via
   `emoji_suggest.extract_emojis` and uses whichever it finds, letting the user type an emoji that
   wasn't among the suggested buttons.
+
+- **Completion history** (`stats.py`, `STATS_STATE_FILE`): Vikunja keeps no history of recurring
+  completions, but sets `done_at` on every completion (one-off or recurring). A completion is recorded
+  when a task's `done_at` is newer than the last one seen for that id, fed by `task.updated` webhooks
+  (requires that event on the Vikunja webhook), the reconciliation pass (active tasks → recurring), and an
+  hourly re-read of tasks done in the last 2 days (one-offs). First run backfills from current `done_at`s,
+  so past recurring completions only count once (the latest). Undo of a `done` drops the newest entry but
+  keeps `last_done_at`, so the undo's own webhook doesn't re-record it. A daily pending/overdue snapshot
+  is stored alongside for the chart's overdue line.
 
 ## Tests
 

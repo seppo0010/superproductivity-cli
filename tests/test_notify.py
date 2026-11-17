@@ -72,3 +72,32 @@ class NotifyIfNew(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class EnsureProjectWebhooks(unittest.TestCase):
+    def _run(self, existing):
+        with patch.object(notify.config, "WEBHOOK_TARGET_URL", "http://hook/webhook"), \
+                patch.object(notify.config, "WEBHOOK_SECRET", "s"), \
+                patch.object(notify.vk, "_real_projects", return_value=[{"id": 1, "title": "A"}, {"id": 2, "title": "B"}]), \
+                patch.object(notify.vk, "_vk_get", side_effect=lambda path: existing.get(path, [])), \
+                patch.object(notify.vk, "_vk_put") as put:
+            notify.ensure_project_webhooks(force=True)
+        return put
+
+    def test_creates_only_where_missing(self):
+        existing = {
+            "/projects/1/webhooks": [{"target_url": "http://hook/webhook", "events": ["task.updated", "task.created"]}],
+            "/projects/2/webhooks": [{"target_url": "http://other/webhook", "events": ["task.updated"]}],
+        }
+        put = self._run(existing)
+        put.assert_called_once_with("/projects/2/webhooks", {
+            "target_url": "http://hook/webhook", "events": ["task.updated"], "secret": "s",
+        })
+
+    def test_wrong_events_on_our_target_still_creates(self):
+        existing = {
+            "/projects/1/webhooks": [{"target_url": "http://hook/webhook", "events": ["task.deleted"]}],
+            "/projects/2/webhooks": [{"target_url": "http://hook/webhook", "events": ["task.updated"]}],
+        }
+        put = self._run(existing)
+        self.assertEqual([c.args[0] for c in put.call_args_list], ["/projects/1/webhooks"])

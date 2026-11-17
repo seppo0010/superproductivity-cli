@@ -7,6 +7,7 @@ import hashlib
 import hmac
 import http.server
 import json
+import time
 from datetime import date, datetime, timezone
 from typing import Optional
 
@@ -15,6 +16,7 @@ import requests
 from . import config
 from . import formatting
 from . import ical
+from . import stats
 from . import vikunja as vk
 from .state import _load_json, _save_json, _state_lock
 from .telegram_api import _send_due_notification, _telegram_call
@@ -76,6 +78,10 @@ def _handle_webhook_payload(payload: dict) -> None:
     data = payload.get("data") or {}
     config.log.info("Webhook event received: %s", event)
 
+    if event in ("task.updated", "task.created"):
+        stats.record_completions(_extract_tasks_from_webhook_data(data))
+        return
+
     if event not in ("task.overdue", "tasks.overdue"):
         return
 
@@ -117,6 +123,56 @@ class _WebhookHandler(http.server.BaseHTTPRequestHandler):
         config.log.info("webhook: " + format, *args)
 
 
+# ─── Per-project webhook registration ───────────────────────────────────────
+#
+# task.updated is only available as a *project* webhook (user-level ones only
+# carry the overdue events), so every project needs its own. Idempotent:
+# a project that already has a webhook to WEBHOOK_TARGET_URL covering every
+# PROJECT_WEBHOOK_EVENTS is left alone; webhooks to other targets (e.g. other
+# listeners) are never touched.
+
+_last_webhook_ensure = 0.0
+
+
+def _project_has_webhook(webhooks: list) -> bool:
+    return any(
+        w.get("target_url") == config.WEBHOOK_TARGET_URL
+        and set(config.PROJECT_WEBHOOK_EVENTS) <= set(w.get("events") or [])
+        for w in webhooks
+    )
+
+
+def ensure_project_webhooks(force: bool = False) -> None:
+    """Registers the task.updated webhook on any project missing it. Runs at
+    most every ENSURE_WEBHOOKS_INTERVAL_SECONDS unless `force`, so new
+    projects get picked up within the hour."""
+    global _last_webhook_ensure
+    if not force and time.monotonic() - _last_webhook_ensure < config.ENSURE_WEBHOOKS_INTERVAL_SECONDS:
+        return
+    projects = vk._real_projects()
+    if not projects:
+        return  # fetch failed (already logged) or nothing to do; retry next pass
+    created = 0
+    for p in projects:
+        try:
+            webhooks = vk._vk_get(f"/projects/{p['id']}/webhooks")
+            if _project_has_webhook(webhooks or []):
+                continue
+            vk._vk_put(f"/projects/{p['id']}/webhooks", {
+                "target_url": config.WEBHOOK_TARGET_URL,
+                "events": config.PROJECT_WEBHOOK_EVENTS,
+                "secret": config.WEBHOOK_SECRET or "",
+            })
+            created += 1
+            config.log.info("Registered %s webhook on project %s (%s)",
+                            ",".join(config.PROJECT_WEBHOOK_EVENTS), p["id"], p["title"])
+        except requests.RequestException as e:
+            config.log.error("Could not ensure webhook on project %s: %s", p["id"], e)
+            return  # leave _last_webhook_ensure unset so the next pass retries
+    _last_webhook_ensure = time.monotonic()
+    config.log.info("Project webhooks checked (%d project(s), %d created)", len(projects), created)
+
+
 def _run_webhook_server() -> None:
     server = http.server.ThreadingHTTPServer((config.WEBHOOK_HOST, config.WEBHOOK_PORT), _WebhookHandler)
     config.log.info("Webhook receiver listening on %s:%d", config.WEBHOOK_HOST, config.WEBHOOK_PORT)
@@ -136,6 +192,12 @@ def check_due_tasks() -> Optional[int]:
     except requests.RequestException as e:
         config.log.error("Could not fetch tasks: %s", e)
         return None
+
+    # Recurring tasks stay active when completed, so their new done_at shows
+    # up here — the safety net for missed task.updated webhooks.
+    stats.record_completions(tasks)
+    stats.record_daily_snapshot(tasks)
+    stats.check_recent_done()
 
     now = datetime.now(timezone.utc)
     overdue = {}
