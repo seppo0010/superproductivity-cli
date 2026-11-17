@@ -9,6 +9,7 @@ from datetime import date, datetime, timedelta, timezone
 import requests
 
 from . import config
+from .avance_flow import _handle_avance_duration, _handle_avance_pick
 from . import formatting
 from . import ical
 from . import vikunja as vk
@@ -78,6 +79,12 @@ def _handle_callback(callback: dict) -> None:
         return
     if action == "puntdue":
         _handle_punt_due(callback_id, chat_id, message_id, payload)
+        return
+    if action == "avance":
+        _handle_avance_pick(callback_id, chat_id, message_id, payload)
+        return
+    if action == "avancedur":
+        _handle_avance_duration(callback_id, chat_id, message_id, payload)
         return
     if action == "estim":
         _handle_estimate_pick(callback_id, chat_id, message_id, payload)

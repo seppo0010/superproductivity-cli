@@ -45,6 +45,19 @@ def _handle_undo(callback_id: str, chat_id, message_id, payload: str) -> None:
             if label_obj is not None and label_obj["id"] not in prev_label_ids:
                 vk._vk_delete(f"/tasks/{prev_task['id']}/labels/{label_obj['id']}")
             result_text = f"↩️ {prev_task['title']} — deshecho"
+        elif entry["action"] == "avance":
+            # Delete the progress entry (and its stats completion), then put
+            # the remainder back on the original: a recurring task drops the
+            # forked copy and returns to this occurrence's due date; a
+            # one-off gets its pre-progress title (estimate) back.
+            vk._vk_delete(f"/tasks/{entry['progress_id']}")
+            stats.remove_latest_completion(entry["progress_id"])
+            if entry.get("fork_id"):
+                vk._vk_delete(f"/tasks/{entry['fork_id']}")
+                vk._vk_task_update(prev_task["id"], {"due_date": prev_task.get("due_date") or ""})
+            else:
+                vk._vk_task_update(prev_task["id"], {"title": prev_task["title"]})
+            result_text = f"↩️ {prev_task['title']} — avance deshecho"
         elif entry["action"] == "estimate":
             vk._vk_task_update(prev_task["id"], {"title": prev_task["title"]})
             result_text = f"↩️ {prev_task['title']} — deshecho"

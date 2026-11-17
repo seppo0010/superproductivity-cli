@@ -11,8 +11,10 @@ webhook is missed and the task is completed again before reconciliation.
 
 State (STATS_STATE_FILE):
     last_done_at: {str(task_id): iso}   newest done_at seen per task
-    completions:  [{task_id, title, project_id, done_at, estimate_min, recurring}]
+    completions:  [{task_id, title, project_id, done_at, estimate_min, recurring, partial}]
     snapshots:    {"YYYY-MM-DD": {"pending": N, "overdue": N}}  one per day
+    progress_ids: [task_id]  tasks created by /avance (avance_flow.py) to log
+                  partial progress — counted as minutes, not as completed tasks
 """
 
 from __future__ import annotations
@@ -34,7 +36,7 @@ _last_recent_done_check = 0.0
 
 
 def _empty_state() -> dict:
-    return {"last_done_at": {}, "completions": [], "snapshots": {}}
+    return {"last_done_at": {}, "completions": [], "snapshots": {}, "progress_ids": []}
 
 
 def _load_state() -> dict:
@@ -68,6 +70,7 @@ def _record_completion_if_new(task: dict, state: dict) -> bool:
         "done_at": iso,
         "estimate_min": vk._parse_estimate_minutes(title),
         "recurring": vk._is_recurring(task),
+        "partial": task["id"] in state["progress_ids"],
     })
     return True
 
@@ -84,6 +87,16 @@ def record_completions(tasks: list) -> int:
     if added:
         config.log.info("Recorded %d task completion(s)", added)
     return added
+
+
+def mark_progress_task(task_id: int) -> None:
+    """Flags `task_id` as a partial-progress entry; call before marking it
+    done so its completion is recorded as partial."""
+    with _state_lock:
+        state = _load_state()
+        if task_id not in state["progress_ids"]:
+            state["progress_ids"].append(task_id)
+            _save_json(config.STATS_STATE_FILE, state)
 
 
 def _remove_latest_completion(task_id: int, state: dict) -> bool:
@@ -181,6 +194,11 @@ def completions_in_range(completions: list, start: date, end: date) -> list:
     return [c for c in completions if (d := _completion_local_date(c)) is not None and start <= d <= end]
 
 
+def finished(completions: list) -> list:
+    """Real completions — without /avance partial-progress entries."""
+    return [c for c in completions if not c.get("partial")]
+
+
 def completions_per_day(completions: list, start: date, end: date) -> dict:
     counts = {start + timedelta(days=i): 0 for i in range((end - start).days + 1)}
     for c in completions:
@@ -246,10 +264,11 @@ def format_summary(completions: list, start: date, end: date, project_titles: di
     """HTML caption for /stats."""
     import html
 
-    in_range = completions_in_range(completions, start, end)
+    with_partial = completions_in_range(completions, start, end)
+    in_range = finished(with_partial)
     week_start = today - timedelta(days=today.weekday())
-    this_week = completions_in_range(completions, week_start, today)
-    last_week = completions_in_range(completions, week_start - timedelta(days=7), week_start - timedelta(days=1))
+    this_week = finished(completions_in_range(completions, week_start, today))
+    last_week = finished(completions_in_range(completions, week_start - timedelta(days=7), week_start - timedelta(days=1)))
     days = (end - start).days + 1
 
     lines = [f"📊 <b>Estadísticas — últimos {days} días</b>", ""]
@@ -257,7 +276,10 @@ def format_summary(completions: list, start: date, end: date, project_titles: di
     recurring = sum(1 for c in in_range if c.get("recurring"))
     if recurring:
         lines.append(f"   🔁 {recurring} recurrentes · {len(in_range) - recurring} únicas")
-    minutes = estimated_minutes(in_range)
+    partial = len(with_partial) - len(in_range)
+    if partial:
+        lines.append(f"⏳ Avances parciales: {partial}")
+    minutes = estimated_minutes(with_partial)
     if minutes:
         lines.append(f"⏱ Tiempo estimado completado: {vk._format_minutes(minutes)}")
     lines.append(f"📅 Esta semana: {len(this_week)} · semana pasada: {len(last_week)}")

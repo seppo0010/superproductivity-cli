@@ -85,6 +85,7 @@ def main() -> None:
                 {"command": "punt", "description": "Posponer una tarea vencida o de hoy"},
                 {"command": "estimar", "description": "Poner o cambiar la estimación de una tarea de hoy"},
                 {"command": "prioridad", "description": "Poner o cambiar la prioridad de una tarea de hoy"},
+                {"command": "avance", "description": "Registrar avance parcial en una tarea de hoy"},
                 {"command": "stats", "description": "Estadísticas y gráfico de tareas completadas"},
             ],
         )

@@ -41,7 +41,8 @@ Telegram poll loop, reconciliation loop) and validates required env vars.
 - `notify.py` — webhook receiver (push path for `task.overdue`/`tasks.overdue`), the reconciliation
   safety-net pass (main loop, catches missed webhooks), and the once-a-day digest.
 - Bot flows (each a two-step callback: pick a task, then pick a value), one module per flow:
-  `new_task_flow.py`, `punt_flow.py` (postpone due date), `estimate_priority_flow.py`, `time_entry_flow.py`
+  `new_task_flow.py`, `punt_flow.py` (postpone due date), `estimate_priority_flow.py`, `avance_flow.py`
+  (`/avance`, partial progress — see below), `time_entry_flow.py`
   (plain-text "HH:MM"/"D/M[/Y]" replies typed instead of pressing a button), `undo.py`.
 - `callback.py` — dispatches inline-keyboard presses to the flow modules; also handles the simple
   one-shot actions (done/delete/snooze/tarjeta) inline.
@@ -86,6 +87,14 @@ Telegram poll loop, reconciliation loop) and validates required env vars.
   so past recurring completions only count once (the latest). Undo of a `done` drops the newest entry but
   keeps `last_done_at`, so the undo's own webhook doesn't re-record it. A daily pending/overdue snapshot
   is stored alongside for the chart's overdue line.
+- **Partial progress** (`/avance`, `avance_flow.py`): logs N minutes as a separate one-off task
+  `[Nm] Title (avance)` in the same project, created then marked done; its id goes into
+  `progress_ids` in the stats state *before* the done update, so `stats.py` records it as `partial`
+  (counted in minutes, not as a completed task or in the chart bars). The original's estimate drops to
+  what's left; a recurring task is forked via `vk._postpone_task` instead (remainder = one-off copy at
+  the same due date), so its schedule and estimate never change. Typed durations reuse
+  `PENDING_ESTIMATE_STATE_FILE` with `"kind": "avance"`. Undo deletes the progress task (+ its stats
+  entry) and the fork, or restores the original title.
 
 ## Tests
 

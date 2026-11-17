@@ -1,6 +1,6 @@
 """Slash-command handling: /hoy, /pending, /mañana, /day, /carga, /calendario,
 /disponibilidad, /hecho, /borrar, /tarjeta, /estimar, /sinestimar, /prioridad,
-/punt, /subte, /stats, and the plain-message fallback that starts the new-task or
+/punt, /subte, /stats, /avance, and the plain-message fallback that starts the new-task or
 time-entry flow."""
 
 from __future__ import annotations
@@ -12,6 +12,7 @@ from typing import Optional
 
 import requests
 
+from . import avance_flow
 from . import config
 from . import formatting
 from . import ical
@@ -109,7 +110,7 @@ def _handle_stats_command(chat_id, arg: str) -> None:
         state["completions"], start, today, vk._project_title_map(), active, today,
     )
     try:
-        per_day = stats.completions_per_day(state["completions"], start, today)
+        per_day = stats.completions_per_day(stats.finished(state["completions"]), start, today)
         png = stats.render_chart(per_day, state["snapshots"])
         _telegram_send_photo(chat_id, png, caption)
     except Exception as e:
@@ -559,6 +560,25 @@ def _handle_message(message: dict) -> None:
         config.log.info("Sent /estimar task picker (%d task(s)) to chat %s", len(tasks), chat_id)
         return
 
+    if command == "/avance":
+        try:
+            tasks = vk._today_tasks()
+        except requests.RequestException as e:
+            config.log.error("Could not fetch today's tasks: %s", e)
+            _telegram_call("sendMessage", chat_id=chat_id, text=f"Error: {e}")
+            return
+
+        if not tasks:
+            _telegram_call("sendMessage", chat_id=chat_id, text="🎉 No hay tareas pendientes hoy.")
+            return
+
+        _telegram_call(
+            "sendMessage", chat_id=chat_id, text="¿En qué tarea avanzaste?",
+            reply_markup=formatting._task_picker_keyboard(tasks, "avance"),
+        )
+        config.log.info("Sent /avance task picker (%d task(s)) to chat %s", len(tasks), chat_id)
+        return
+
     if command == "/sinestimar":
         try:
             task = vk._next_unestimated_task()
@@ -654,6 +674,9 @@ def _handle_message(message: dict) -> None:
 
     pending_estimate_state = _load_json(config.PENDING_ESTIMATE_STATE_FILE, {})
     pending_estimate = pending_estimate_state.get(str(chat_id))
+    if pending_estimate and pending_estimate.get("kind") == avance_flow.PENDING_KIND:
+        avance_flow._handle_avance_text(chat_id, text, pending_estimate)
+        return
     if pending_estimate:
         _handle_estimate_text(chat_id, text, pending_estimate)
         return
